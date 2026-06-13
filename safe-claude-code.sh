@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
-shopt -s nocasematch extglob
 
 API_URL="${SCC_API:-https://ipinfo.io}"
-CONFIG_FILE="${SCC_CONFIG_FILE:-$HOME/.config/safe-claude-code/rules.conf}"
 
 deny() {
   echo "❌ $1" >&2
   [[ -n "${2:-}" ]] && printf '%s\n' "$2" >&2
+  exit 1
+}
+
+cancel() {
+  echo "Cancelled." >&2
   exit 1
 }
 
@@ -18,72 +21,139 @@ trim() {
   printf '%s' "$s"
 }
 
+detect_clis() {
+  cli_names=()
+  cli_paths=()
+
+  if command -v codex >/dev/null 2>&1; then
+    cli_names+=("codex")
+    cli_paths+=("$(command -v codex)")
+  fi
+
+  if command -v claude >/dev/null 2>&1; then
+    cli_names+=("claude")
+    cli_paths+=("$(command -v claude)")
+  fi
+}
+
+render_cli_menu() {
+  local selected="$1" i prefix
+
+  if (( MENU_RENDERED_LINES > 0 )); then
+    printf '\033[%dA' "$MENU_RENDERED_LINES" >&2
+  fi
+
+  printf '\033[?25l' >&2
+  printf 'Select CLI to launch:\033[K\n\033[K\n' >&2
+
+  for i in "${!cli_names[@]}"; do
+    if [[ "$i" == "$selected" ]]; then
+      prefix=">"
+    else
+      prefix=" "
+    fi
+    printf '%s %-10s %s\033[K\n' "$prefix" "${cli_names[$i]}" "${cli_paths[$i]}" >&2
+  done
+
+  printf '\033[K\n↑/↓ move, Enter select, q cancel\033[K\n' >&2
+  MENU_RENDERED_LINES=$((${#cli_names[@]} + 4))
+}
+
+restore_cursor() {
+  printf '\033[?25h' >&2
+}
+
+read_key() {
+  local key rest
+
+  IFS= read -r -s -n1 key || return 1
+  if [[ "$key" == $'\e' ]]; then
+    IFS= read -r -s -n2 -t 1 rest || rest=""
+    key+="$rest"
+  fi
+
+  printf '%s' "$key"
+}
+
+select_cli() {
+  local selected=0 key
+
+  if (( ${#cli_names[@]} == 0 )); then
+    deny "No supported CLI found. Install codex or claude first."
+  fi
+
+  if (( ${#cli_names[@]} == 1 )); then
+    SELECTED_CLI="${cli_names[0]}"
+    echo "Detected CLI: $SELECTED_CLI (${cli_paths[0]})" >&2
+    return
+  fi
+
+  if [[ ! -t 0 && "${SCC_ALLOW_NON_TTY:-}" != "1" ]]; then
+    deny "Interactive CLI selection requires a TTY."
+  fi
+
+  MENU_RENDERED_LINES=0
+  trap 'restore_cursor; echo >&2; exit 130' INT TERM
+  while true; do
+    render_cli_menu "$selected"
+    key="$(read_key)" || { restore_cursor; echo >&2; cancel; }
+
+    case "$key" in
+      $'\e[A')
+        if (( selected == 0 )); then
+          selected=$((${#cli_names[@]} - 1))
+        else
+          selected=$((selected - 1))
+        fi
+        ;;
+      $'\e[B')
+        selected=$(((selected + 1) % ${#cli_names[@]}))
+        ;;
+      "")
+        SELECTED_CLI="${cli_names[$selected]}"
+        restore_cursor
+        trap - INT TERM
+        echo >&2
+        echo "Selected CLI: $SELECTED_CLI (${cli_paths[$selected]})" >&2
+        return
+        ;;
+      q|Q)
+        restore_cursor
+        trap - INT TERM
+        echo >&2
+        cancel
+        ;;
+    esac
+  done
+}
+
+confirm_launch() {
+  local answer
+
+  echo >&2
+  echo "IPinfo response:" >&2
+  printf '%s\n' "$resp" >&2
+  echo >&2
+  printf 'Continue and launch %s? [y/N] ' "$SELECTED_CLI" >&2
+
+  if [[ ! -t 0 && "${SCC_ALLOW_NON_TTY:-}" != "1" ]]; then
+    echo >&2
+    deny "Confirmation requires a TTY."
+  fi
+
+  IFS= read -r answer || cancel
+  case "$(trim "$answer")" in
+    y|Y|yes|YES|Yes) ;;
+    *) cancel ;;
+  esac
+}
+
+detect_clis
+select_cli
+
 resp="$(curl -fsS --max-time 5 "$API_URL")" || deny "Failed to fetch $API_URL"
 [[ "$(trim "$resp")" == \{* ]] || deny "Invalid JSON from $API_URL" "$resp"
 
-get_field() {
-  local f="$1"
-  if [[ "$resp" =~ \"$f\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
-  fi
-}
+confirm_launch
 
-rule_keys=()
-rule_vals=()
-
-set_rule() {
-  local k="$1" v="$2" i
-  for i in "${!rule_keys[@]}"; do
-    if [[ "${rule_keys[$i]}" == "$k" ]]; then
-      rule_vals[$i]="$v"
-      return
-    fi
-  done
-  rule_keys+=("$k")
-  rule_vals+=("$v")
-}
-
-if [[ -f "$CONFIG_FILE" ]]; then
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="$(trim "$line")"
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    [[ "$line" != *=* ]] && continue
-    key="$(trim "${line%%=*}")"
-    val="${line#*=}"
-    [[ -n "$key" ]] && set_rule "$key" "$val"
-  done < "$CONFIG_FILE"
-fi
-
-for name in "${!SCC_@}"; do
-  field="${name#SCC_}"
-  [[ "$field" == "CONFIG_FILE" || "$field" == "API" ]] && continue
-  set_rule "$field" "${!name}"
-done
-
-if (( ${#rule_keys[@]} == 0 )); then
-  deny "No rules configured. Set SCC_<field>=patterns or create $CONFIG_FILE" "$resp"
-fi
-
-for i in "${!rule_keys[@]}"; do
-  field="${rule_keys[$i]}"
-  patterns="${rule_vals[$i]}"
-  actual="$(get_field "$field")"
-  if [[ -z "$actual" ]]; then
-    deny "Field '$field' not present in response" "$resp"
-  fi
-  matched=0
-  IFS=',' read -ra pats <<< "$patterns"
-  for pat in "${pats[@]}"; do
-    pat="$(trim "$pat")"
-    [[ -z "$pat" ]] && continue
-    if [[ "$actual" == $pat ]]; then
-      matched=1
-      break
-    fi
-  done
-  if (( ! matched )); then
-    deny "Field '$field'='$actual' does not match: $patterns" "$resp"
-  fi
-done
-
-exec claude "$@"
+exec "$SELECTED_CLI" "$@"

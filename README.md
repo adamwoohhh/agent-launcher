@@ -1,8 +1,8 @@
 # Safe Claude Code
 
-如果你是通过静态住宅 IP 代理访问 Clade 的，启动 Claude Code 之前，先检查你的网络环境，避免污染 IP 使用记录。
+如果你通过静态住宅 IP 代理访问 AI CLI，启动前最好先确认当前出口 IP，避免污染 IP 使用记录。
 
-`safe-claude-code` 通过 [ipinfo.io](https://ipinfo.io) 拿到当前出口 IP 的地理信息，按你配置的规则做白名单校验，命中才启动 `claude`，否则打印完整 JSON 并退出。
+`safe-claude-code` 是一个极简启动器：它会探测本机安装的 `codex` 和 `claude`，让你选择要启动的 CLI，然后通过 [ipinfo.io](https://ipinfo.io) 获取当前出口 IP 信息。只有你确认后，它才会执行所选 CLI。
 
 ## 安装
 
@@ -10,13 +10,12 @@
 curl -fsSL https://raw.githubusercontent.com/adamwoohhh/safe-claude-code/main/install.sh | bash
 ```
 
-安装到 `~/.local/bin/` 下，会建三个命令：
+安装到 `~/.local/bin/` 下，会创建两个命令：
 
-- `safe-claude-code`（全名，主包装器）
+- `safe-claude-code`（全名，主启动器）
 - `scc`（短名，`safe-claude-code` 的符号链接）
-- `scc-config`（配置管理工具，独立命令，避免和 `claude` 自己的子命令冲突）
 
-如果 `~/.local/bin` 不在 PATH，安装器会提示你加。
+如果 `~/.local/bin` 不在 PATH，安装器会提示你添加。
 
 ### 安装器的环境变量
 
@@ -35,12 +34,13 @@ curl -fsSL https://raw.githubusercontent.com/adamwoohhh/safe-claude-code/main/in
 
 ## 使用前提
 
-确保 `ipinfo.io` 和 claude 相关的域名使用的是同一套代理规则。完整的代理教程可以参考 [Claude Code 安全使用指南](https://github.com/sakurs2/safe-claude?tab=readme-ov-file)。
+确保 `ipinfo.io` 和你要启动的 CLI 相关域名使用的是同一套代理规则。完整的代理教程可以参考 [Claude Code 安全使用指南](https://github.com/sakurs2/safe-claude?tab=readme-ov-file)。
 
 ```yaml
 rules:
   - DOMAIN-KEYWORD,anthropic,纯净IP代理
   - DOMAIN-KEYWORD,claude,纯净IP代理
+  - DOMAIN-KEYWORD,openai,纯净IP代理
   - DOMAIN-KEYWORD,ipinfo,纯净IP代理
   - DOMAIN-KEYWORD,github,机房代理
   - DOMAIN-KEYWORD,google,机房代理
@@ -48,106 +48,79 @@ rules:
 
 ## 用法
 
-把原本敲 `claude` 的地方换成 `scc`（或 `safe-claude-code`）即可，参数会原样转发给 `claude`。
-
-### 规则语义
-
-- 白名单：所有配置的字段都必须命中其允许的 pattern 列表才放行
-- Pattern 支持 glob 通配符：`*`、`?`、`[...]`
-- 大小写不敏感
-- 多个 pattern 用逗号分隔，命中任意一个即可
-- 未配置的字段不检查
-- **未配置任何规则时拒绝启动**（避免裸跑）
-
-### 通过环境变量配置
-
-变量名格式：`SCC_<ipinfo字段名>=pattern1,pattern2,...`
+运行：
 
 ```bash
-# 只允许中国大陆或香港
-SCC_country=CN,HK scc
-
-# 时区必须是亚洲
-SCC_timezone='Asia/*' scc
-
-# 多字段同时校验
-SCC_country=CN SCC_city='Beijing' scc
+scc
 ```
 
-### 通过配置文件配置
+如果本机同时安装了 `codex` 和 `claude`，会出现选择器：
 
-默认路径：`~/.config/safe-claude-code/rules.conf`，可用 `SCC_CONFIG_FILE` 环境变量覆盖。
+```text
+Select CLI to launch:
 
-格式：每行 `field=patterns`，`#` 开头为注释，空行忽略。
+> codex      /usr/local/bin/codex
+  claude     /usr/local/bin/claude
 
-```conf
-# ~/.config/safe-claude-code/rules.conf
-country=CN,HK
-timezone=Asia/*
-# city=Beijing,Shanghai,*Hong Kong*
+↑/↓ move, Enter select, q cancel
 ```
 
-环境变量优先于配置文件，方便临时覆盖。
+用方向键切换，回车确认，`q` 取消。
 
-### 用 `scc-config` 管理配置
+如果只安装了其中一个 CLI，`scc` 会自动选择它，然后继续展示 IP 信息。
 
-懒得记路径或者想确认生效情况，用配套的 `scc-config`：
+选择 CLI 后，`scc` 会打印 ipinfo 返回结果，并要求你确认：
+
+```text
+IPinfo response:
+{"ip":"1.2.3.4","city":"Beijing","country":"CN","timezone":"Asia/Shanghai"}
+
+Continue and launch codex? [y/N]
+```
+
+只有输入 `y` 或 `yes` 才会启动；直接回车或其他输入都会取消。
+
+参数会原样转发给最终 CLI：
 
 ```bash
-scc-config edit     # 在 $EDITOR 里打开 rules.conf；不存在则先生成带注释的模板
-scc-config show     # 打印合并后生效的规则（文件 + SCC_* 环境变量），并标注来源
-scc-config path     # 只打印配置文件路径
+scc --model gpt-5
 ```
 
-`scc-config show` 的输出示例：
+如果你选择 `codex`，等价于：
 
-```
-# Config file: /Users/you/.config/safe-claude-code/rules.conf
-
-country=CN,HK                     # from file
-timezone=Asia/Shanghai            # from env:SCC_timezone
+```bash
+codex --model gpt-5
 ```
 
-> 之所以拆成独立命令而不是做成 `scc config ...`，是为了避免和未来 `claude` 自己的子命令冲突——`scc` 永远是纯透传。
-
-### 可用字段
-
-来自 ipinfo.io 响应的顶层字段：
-
-- `ip` — 出口 IP
-- `city` — 城市
-- `region` — 省/州
-- `country` — 国家代码（如 `CN`、`HK`、`US`）
-- `loc` — 经纬度
-- `org` — ISP/运营商（含 ASN）
-- `postal` — 邮编
-- `timezone` — 时区（如 `Asia/Shanghai`）
-
-### 保留环境变量
+## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `SCC_API` | `https://ipinfo.io` | 改成自建/代理的 IP 信息接口 |
-| `SCC_CONFIG_FILE` | `~/.config/safe-claude-code/rules.conf` | 配置文件路径 |
 
 ## 失败时的行为
 
-任一条件不满足都会：
+以下情况会拒绝启动：
 
-1. 打印 `❌` + 错误原因（哪个字段、当前值、期望 pattern）到 stderr
-2. 打印完整的 ipinfo.io JSON 到 stderr，方便排查
-3. 退出码 `1`，不会启动 `claude`
+1. 本机没有安装 `codex` 或 `claude`
+2. 无法获取 `SCC_API` 的响应
+3. 响应看起来不是 JSON
+4. 用户取消 CLI 选择
+5. 用户没有确认启动
+
+失败时退出码为 `1`，不会启动目标 CLI。
 
 ## 依赖
 
 - `bash` 3.2+（macOS 自带版本即可）
 - `curl`
+- 至少安装一个支持的 CLI：`codex` 或 `claude`
 
 无需 `jq` 或其它工具。
 
 ## 开发
 
-跑单元测试（纯 bash，无依赖，所有测试在临时目录里跑并 mock 掉 `curl` / `claude`，不会碰你 `~/.config/` 或 `~/.local/bin/`）：
+跑单元测试（纯 bash，无依赖，所有测试在临时目录里跑并 mock 掉 `curl` / `codex` / `claude`）：
 
 ```bash
 ./test.sh
@@ -160,5 +133,5 @@ timezone=Asia/Shanghai            # from env:SCC_timezone
 curl -fsSL https://raw.githubusercontent.com/adamwoohhh/safe-claude-code/main/install.sh | bash
 
 # 卸载
-rm ~/.local/bin/safe-claude-code ~/.local/bin/scc ~/.local/bin/scc-config
+rm ~/.local/bin/safe-claude-code ~/.local/bin/scc
 ```

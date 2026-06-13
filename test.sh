@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# Unit tests for safe-claude-code.sh and scc-config.sh.
-# All tests run in an isolated temp dir with mocked curl/claude.
-# Nothing under $HOME or /etc is touched.
+# Unit tests for safe-claude-code.sh.
+# All tests run in an isolated temp dir with mocked curl/codex/claude.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAIN="$SCRIPT_DIR/safe-claude-code.sh"
-CONFIG_TOOL="$SCRIPT_DIR/scc-config.sh"
 
-[[ -f "$MAIN" ]]        || { echo "missing: $MAIN" >&2; exit 1; }
-[[ -f "$CONFIG_TOOL" ]] || { echo "missing: $CONFIG_TOOL" >&2; exit 1; }
+[[ -f "$MAIN" ]] || { echo "missing: $MAIN" >&2; exit 1; }
 
 PASS=0
 FAIL=0
@@ -18,23 +15,12 @@ FAILED=()
 
 # ---------- fixtures ----------
 
-# Set up a clean per-test sandbox. Called inside each test's subshell.
 setup_env() {
   TMP="$(mktemp -d)"
-  mkdir -p "$TMP/bin" "$TMP/config"
-  CONFIG_FILE="$TMP/config/rules.conf"
+  mkdir -p "$TMP/bin"
+  CODEX_LOG="$TMP/codex.log"
   CLAUDE_LOG="$TMP/claude.log"
 
-  # Fake `claude` — records args, prints a sentinel, exits 0.
-  cat > "$TMP/bin/claude" <<EOF
-#!/usr/bin/env bash
-printf '%s\n' "\$@" > "$CLAUDE_LOG"
-echo MOCK_CLAUDE_CALLED
-exit 0
-EOF
-  chmod +x "$TMP/bin/claude"
-
-  # Fake `curl` — ignores args, returns \$MOCK_RESP, or fails if MOCK_CURL_FAIL=1.
   cat > "$TMP/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${MOCK_CURL_FAIL:-0}" == "1" ]]; then
@@ -44,18 +30,28 @@ printf '%s' "${MOCK_RESP:-{\}}"
 EOF
   chmod +x "$TMP/bin/curl"
 
-  export PATH="$TMP/bin:$PATH"
-  export SCC_CONFIG_FILE="$CONFIG_FILE"
+  export PATH="$TMP/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  export SCC_ALLOW_NON_TTY=1
 
-  # Strip any SCC_* the user already has in their shell, so tests are deterministic.
   local v
   for v in $(env | awk -F= '/^SCC_/ {print $1}'); do
-    [[ "$v" == "SCC_CONFIG_FILE" ]] && continue
+    [[ "$v" == "SCC_ALLOW_NON_TTY" ]] && continue
     unset "$v"
   done
 }
 
 cleanup_env() { rm -rf "$TMP"; }
+
+add_fake_cli() {
+  local name="$1" log="$2"
+  cat > "$TMP/bin/$name" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$log"
+echo MOCK_${name}_CALLED
+exit 0
+EOF
+  chmod +x "$TMP/bin/$name"
+}
 
 # ---------- assertions ----------
 
@@ -103,216 +99,106 @@ run_test() {
   fi
 }
 
-# ========== scc-config tests ==========
-
-t_config_help() {
-  out="$("$CONFIG_TOOL" help 2>&1)"
-  assert_contains "$out" "Usage: scc-config"
-}
-
-t_config_path() {
-  out="$("$CONFIG_TOOL" path)"
-  assert_eq "$out" "$CONFIG_FILE"
-}
-
-t_config_show_empty() {
-  out="$("$CONFIG_TOOL" show)"
-  assert_contains "$out" "no rules configured"
-}
-
-t_config_show_reads_file() {
-  cat > "$CONFIG_FILE" <<EOF
-# comment line
-country=CN,HK
-
-timezone=Asia/*
-EOF
-  out="$("$CONFIG_TOOL" show)"
-  assert_contains "$out" "country=CN,HK"   || return 1
-  assert_contains "$out" "timezone=Asia/*" || return 1
-  assert_contains "$out" "from file"
-}
-
-t_config_env_overrides_file() {
-  echo "country=US" > "$CONFIG_FILE"
-  out="$(SCC_country=CN,HK "$CONFIG_TOOL" show)"
-  assert_contains "$out" "country=CN,HK"        || return 1
-  assert_contains "$out" "from env:SCC_country" || return 1
-  assert_not_contains "$out" "country=US"
-}
-
-t_config_skips_reserved_vars() {
-  out="$(SCC_API=http://example.com SCC_country=CN "$CONFIG_TOOL" show)"
-  assert_contains     "$out" "country=CN" || return 1
-  assert_not_contains "$out" "API="       || return 1
-  assert_not_contains "$out" "CONFIG_FILE="
-}
-
-t_config_ignores_blank_and_comment_lines() {
-  cat > "$CONFIG_FILE" <<EOF
-
-# this is a comment
-   # indented comment
-
-country=CN
-EOF
-  out="$("$CONFIG_TOOL" show)"
-  # Only one rule should appear.
-  local n
-  n="$(printf '%s\n' "$out" | grep -c '^[a-z]')"
-  assert_eq "$n" "1" "expected exactly one rule line"
-}
-
-t_config_unknown_command_exits_1() {
-  out="$("$CONFIG_TOOL" bogus 2>&1)"
-  local rc=$?
-  assert_eq "$rc" "1"                       || return 1
-  assert_contains "$out" "Unknown command"
-}
-
-t_config_edit_creates_template() {
-  EDITOR=true "$CONFIG_TOOL" edit
-  [[ -f "$CONFIG_FILE" ]] || { echo "    config file was not created" >&2; return 1; }
-  local content; content="$(cat "$CONFIG_FILE")"
-  assert_contains "$content" "safe-claude-code rules"
-}
-
-t_config_edit_preserves_existing_file() {
-  printf 'country=CN\n' > "$CONFIG_FILE"
-  EDITOR=true "$CONFIG_TOOL" edit
-  local content; content="$(cat "$CONFIG_FILE")"
-  assert_eq "$content" "country=CN" "existing file should be untouched"
-}
-
 # ========== safe-claude-code tests ==========
 
-t_main_no_rules_denies() {
-  export MOCK_RESP='{"country":"CN"}'
-  out="$(bash "$MAIN" 2>&1)"
+t_no_cli_denies() {
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf 'y\n' | bash "$MAIN" 2>&1)"
   local rc=$?
-  assert_eq "$rc" "1"                          || return 1
-  assert_contains "$out" "No rules configured"
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "No supported CLI found"
 }
 
-t_main_country_match_runs_claude() {
-  export MOCK_RESP='{"country":"CN","timezone":"Asia/Shanghai"}'
-  echo "country=CN,HK" > "$CONFIG_FILE"
-  out="$(bash "$MAIN" 2>&1)"
-  assert_contains "$out" "MOCK_CLAUDE_CALLED"
+t_single_codex_prints_ipinfo_and_runs_after_yes() {
+  add_fake_cli codex "$CODEX_LOG"
+  export MOCK_RESP='{"ip":"1.2.3.4","city":"Beijing","country":"CN","timezone":"Asia/Shanghai"}'
+  out="$(printf 'y\n' | bash "$MAIN" --foo 'bar baz' 2>&1)"
+  assert_contains "$out" "Detected CLI: codex" || return 1
+  assert_contains "$out" '"ip":"1.2.3.4"' || return 1
+  assert_contains "$out" "MOCK_codex_CALLED" || return 1
+  got="$(cat "$CODEX_LOG")"
+  want=$'--foo\nbar baz'
+  assert_eq "$got" "$want" "args were not forwarded to codex"
 }
 
-t_main_country_mismatch_denies() {
-  export MOCK_RESP='{"country":"US"}'
-  echo "country=CN,HK" > "$CONFIG_FILE"
-  out="$(bash "$MAIN" 2>&1)"
+t_single_claude_runs_after_yes() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf 'yes\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "Detected CLI: claude" || return 1
+  assert_contains "$out" "MOCK_claude_CALLED"
+}
+
+t_confirmation_defaults_to_no() {
+  add_fake_cli codex "$CODEX_LOG"
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\n' | bash "$MAIN" 2>&1)"
   local rc=$?
-  assert_eq "$rc" "1"                       || return 1
-  assert_contains "$out" "does not match"   || return 1
-  assert_not_contains "$out" "MOCK_CLAUDE_CALLED"
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "Cancelled" || return 1
+  assert_not_contains "$out" "MOCK_codex_CALLED"
 }
 
-t_main_glob_match() {
-  export MOCK_RESP='{"country":"CN","timezone":"Asia/Shanghai"}'
-  echo "timezone=Asia/*" > "$CONFIG_FILE"
-  out="$(bash "$MAIN" 2>&1)"
-  assert_contains "$out" "MOCK_CLAUDE_CALLED"
+t_selector_enter_chooses_first_cli() {
+  add_fake_cli codex "$CODEX_LOG"
+  add_fake_cli claude "$CLAUDE_LOG"
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\n''y\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "Select CLI to launch" || return 1
+  assert_contains "$out" "MOCK_codex_CALLED" || return 1
+  assert_not_contains "$out" "MOCK_claude_CALLED"
 }
 
-t_main_case_insensitive() {
-  export MOCK_RESP='{"country":"cn"}'
-  echo "country=CN" > "$CONFIG_FILE"
-  out="$(bash "$MAIN" 2>&1)"
-  assert_contains "$out" "MOCK_CLAUDE_CALLED"
-}
-
-t_main_multi_pattern_any_match() {
-  export MOCK_RESP='{"country":"HK"}'
-  echo "country=CN,HK,TW" > "$CONFIG_FILE"
-  out="$(bash "$MAIN" 2>&1)"
-  assert_contains "$out" "MOCK_CLAUDE_CALLED"
-}
-
-t_main_env_overrides_file() {
-  export MOCK_RESP='{"country":"CN"}'
-  echo "country=US" > "$CONFIG_FILE"   # file says only US is OK
-  out="$(SCC_country=CN bash "$MAIN" 2>&1)"
-  assert_contains "$out" "MOCK_CLAUDE_CALLED"
-}
-
-t_main_args_forwarded_to_claude() {
-  export MOCK_RESP='{"country":"CN"}'
-  echo "country=CN" > "$CONFIG_FILE"
-  bash "$MAIN" --foo bar 'baz qux' >/dev/null 2>&1
-  local got want
+t_selector_down_enter_chooses_second_cli() {
+  add_fake_cli codex "$CODEX_LOG"
+  add_fake_cli claude "$CLAUDE_LOG"
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\033[B\n''y\n' | bash "$MAIN" --model sonnet 2>&1)"
+  assert_contains "$out" "MOCK_claude_CALLED" || return 1
   got="$(cat "$CLAUDE_LOG")"
-  want=$'--foo\nbar\nbaz qux'
-  assert_eq "$got" "$want" "args were not forwarded verbatim"
+  want=$'--model\nsonnet'
+  assert_eq "$got" "$want" "args were not forwarded to claude"
 }
 
-t_main_field_missing_in_response() {
-  export MOCK_RESP='{"country":"CN"}'
-  echo "city=Beijing" > "$CONFIG_FILE"   # response has no "city"
-  out="$(bash "$MAIN" 2>&1)"
+t_selector_q_cancels() {
+  add_fake_cli codex "$CODEX_LOG"
+  add_fake_cli claude "$CLAUDE_LOG"
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf 'q' | bash "$MAIN" 2>&1)"
   local rc=$?
-  assert_eq "$rc" "1"                  || return 1
-  assert_contains "$out" "not present"
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "Cancelled" || return 1
+  assert_not_contains "$out" "MOCK_codex_CALLED" || return 1
+  assert_not_contains "$out" "MOCK_claude_CALLED"
 }
 
-t_main_curl_failure_denies() {
-  echo "country=CN" > "$CONFIG_FILE"
+t_curl_failure_denies() {
+  add_fake_cli codex "$CODEX_LOG"
   out="$(MOCK_CURL_FAIL=1 bash "$MAIN" 2>&1)"
   local rc=$?
-  assert_eq "$rc" "1"                       || return 1
+  assert_eq "$rc" "1" || return 1
   assert_contains "$out" "Failed to fetch"
 }
 
-t_main_invalid_json_denies() {
+t_invalid_json_denies() {
+  add_fake_cli codex "$CODEX_LOG"
   export MOCK_RESP='not json at all'
-  echo "country=CN" > "$CONFIG_FILE"
   out="$(bash "$MAIN" 2>&1)"
   local rc=$?
-  assert_eq "$rc" "1"                     || return 1
+  assert_eq "$rc" "1" || return 1
   assert_contains "$out" "Invalid JSON"
 }
 
-t_main_reserved_env_not_treated_as_rule() {
-  # Only SCC_API is set (which is reserved). No rules → should deny with "No rules configured",
-  # NOT try to match an "API" field.
-  export MOCK_RESP='{"country":"CN"}'
-  out="$(SCC_API=http://example.com bash "$MAIN" 2>&1)"
-  local rc=$?
-  assert_eq "$rc" "1"                                 || return 1
-  assert_contains "$out" "No rules configured"
-}
-
-# ---------- driver ----------
-
-echo "scc-config:"
-run_test "help prints usage"                          t_config_help
-run_test "path prints rules file path"                t_config_path
-run_test "show with no rules"                         t_config_show_empty
-run_test "show reads rules from file"                 t_config_show_reads_file
-run_test "env overrides file in show output"          t_config_env_overrides_file
-run_test "show skips SCC_API and SCC_CONFIG_FILE"     t_config_skips_reserved_vars
-run_test "show ignores blank and comment lines"       t_config_ignores_blank_and_comment_lines
-run_test "unknown command exits 1"                    t_config_unknown_command_exits_1
-run_test "edit creates template when file missing"    t_config_edit_creates_template
-run_test "edit preserves existing file"               t_config_edit_preserves_existing_file
-
-echo
 echo "safe-claude-code:"
-run_test "no rules → deny"                            t_main_no_rules_denies
-run_test "country match → claude runs"                t_main_country_match_runs_claude
-run_test "country mismatch → deny"                    t_main_country_mismatch_denies
-run_test "timezone glob (Asia/*) matches"             t_main_glob_match
-run_test "match is case-insensitive"                  t_main_case_insensitive
-run_test "multi-pattern: any match passes"            t_main_multi_pattern_any_match
-run_test "env rule overrides file rule"               t_main_env_overrides_file
-run_test "args forwarded verbatim to claude"          t_main_args_forwarded_to_claude
-run_test "field missing in response → deny"           t_main_field_missing_in_response
-run_test "curl failure → deny"                        t_main_curl_failure_denies
-run_test "invalid JSON response → deny"               t_main_invalid_json_denies
-run_test "SCC_API is not treated as a rule"           t_main_reserved_env_not_treated_as_rule
+run_test "no supported CLI -> deny"                         t_no_cli_denies
+run_test "single codex prints ipinfo and runs after yes"     t_single_codex_prints_ipinfo_and_runs_after_yes
+run_test "single claude runs after yes"                      t_single_claude_runs_after_yes
+run_test "confirmation defaults to no"                       t_confirmation_defaults_to_no
+run_test "selector Enter chooses first CLI"                  t_selector_enter_chooses_first_cli
+run_test "selector Down+Enter chooses second CLI"            t_selector_down_enter_chooses_second_cli
+run_test "selector q cancels"                                t_selector_q_cancels
+run_test "curl failure -> deny"                              t_curl_failure_denies
+run_test "invalid JSON response -> deny"                     t_invalid_json_denies
 
 echo
 echo "===================="
