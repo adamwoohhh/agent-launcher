@@ -17,7 +17,7 @@ info "Target dir:    $INSTALL_DIR"
 
 mkdir -p "$INSTALL_DIR"
 
-TARGET="$INSTALL_DIR/safe-claude-code"
+TARGET="$INSTALL_DIR/agent-launch"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
@@ -28,12 +28,12 @@ head -n1 "$TMP" | grep -q '^#!/usr/bin/env bash$' || err "Downloaded file doesn'
 mv "$TMP" "$TARGET"
 chmod +x "$TARGET"
 
-ln -sf safe-claude-code "$INSTALL_DIR/scc"
-rm -f "$INSTALL_DIR/scc-config"
+ln -sf agent-launch "$INSTALL_DIR/al"
+rm -f "$INSTALL_DIR/safe-claude-code" "$INSTALL_DIR/scc" "$INSTALL_DIR/scc-config"
 
 info "Installed:"
 info "  $TARGET"
-info "  $INSTALL_DIR/scc -> safe-claude-code"
+info "  $INSTALL_DIR/al -> agent-launch"
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*)
@@ -52,8 +52,8 @@ esac
 cat <<'USAGE'
 
 Quick start:
-  # Select codex or claude, review IPinfo, then confirm launch
-  scc
+  # Select codex or claude, review startup check, then confirm launch
+  al
 
 Re-run this installer anytime to update.
 USAGE

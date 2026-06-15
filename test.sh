@@ -6,8 +6,10 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MAIN="$SCRIPT_DIR/safe-claude-code.sh"
+INSTALLER="$SCRIPT_DIR/install.sh"
 
 [[ -f "$MAIN" ]] || { echo "missing: $MAIN" >&2; exit 1; }
+[[ -f "$INSTALLER" ]] || { echo "missing: $INSTALLER" >&2; exit 1; }
 
 PASS=0
 FAIL=0
@@ -28,6 +30,20 @@ setup_env() {
 #!/usr/bin/env bash
 if [[ "${MOCK_CURL_FAIL:-0}" == "1" ]]; then
   exit 22
+fi
+out=""
+while (($#)); do
+  case "$1" in
+    -o)
+      shift
+      out="${1:-}"
+      ;;
+  esac
+  shift || true
+done
+if [[ -n "$out" ]]; then
+  printf '%s' "${MOCK_RESP:-{\}}" > "$out"
+  exit 0
 fi
 printf '%s' "${MOCK_RESP:-{\}}"
 EOF
@@ -239,10 +255,17 @@ t_single_claude_runs_after_yes() {
   assert_contains "$out" "MOCK_claude_CALLED"
 }
 
-t_confirmation_defaults_to_no() {
+t_confirmation_defaults_to_yes() {
   add_fake_cli codex "$CODEX_LOG"
   export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
   out="$(printf '\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "MOCK_codex_CALLED" || return 1
+}
+
+t_confirmation_no_cancels() {
+  add_fake_cli codex "$CODEX_LOG"
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf 'n\n' | bash "$MAIN" 2>&1)"
   local rc=$?
   assert_eq "$rc" "1" || return 1
   assert_contains "$out" "Cancelled" || return 1
@@ -443,6 +466,18 @@ t_claude_unchecked_skill_requires_local_claude_confirmation() {
   [[ ! -d ".claude" ]] || { echo "    .claude should not be created when user declines" >&2; rm -rf ".claude"; return 1; }
 }
 
+t_claude_local_claude_creation_defaults_to_yes() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  setup_claude_skills
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf ' \n''\n''\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "Create temporary .claude" || return 1
+  assert_contains "$out" "MOCK_claude_CALLED" || return 1
+  got_env="$(cat "$CLAUDE_LOG.env")"
+  assert_eq "$got_env" "$PWD/.claude" "Claude was not launched with local CLAUDE_CONFIG_DIR"
+  [[ ! -d ".claude" ]] || { echo "    temporary .claude was not cleaned up" >&2; rm -rf ".claude"; return 1; }
+}
+
 t_claude_temp_config_inherits_global_non_skill_files() {
   add_fake_cli claude "$CLAUDE_LOG"
   setup_claude_global_config
@@ -475,11 +510,32 @@ t_claude_unchecked_plugin_creates_temp_plugins_without_disabled_plugin() {
   [[ ! -d ".claude" ]] || { echo "    temporary .claude was not cleaned up" >&2; rm -rf ".claude"; return 1; }
 }
 
+t_installer_creates_agent_launch_commands() {
+  local install_dir="$TMP/install-bin"
+  mkdir -p "$install_dir"
+  printf '%s' old > "$install_dir/safe-claude-code"
+  ln -sf safe-claude-code "$install_dir/scc"
+  printf '%s' old > "$install_dir/scc-config"
+
+  export MOCK_RESP='#!/usr/bin/env bash
+echo installed agent launcher
+'
+  out="$(SCC_INSTALL_DIR="$install_dir" bash "$INSTALLER" 2>&1)"
+  assert_contains "$out" "$install_dir/agent-launch" || return 1
+  assert_contains "$out" "$install_dir/al -> agent-launch" || return 1
+  [[ -x "$install_dir/agent-launch" ]] || { echo "    agent-launch was not installed as executable" >&2; return 1; }
+  assert_eq "$(readlink "$install_dir/al")" "agent-launch" "al should point to agent-launch" || return 1
+  [[ ! -e "$install_dir/safe-claude-code" ]] || { echo "    old safe-claude-code command should be removed" >&2; return 1; }
+  [[ ! -e "$install_dir/scc" ]] || { echo "    old scc command should be removed" >&2; return 1; }
+  [[ ! -e "$install_dir/scc-config" ]] || { echo "    old scc-config command should be removed" >&2; return 1; }
+}
+
 echo "safe-claude-code:"
 run_test "no supported CLI -> deny"                         t_no_cli_denies
 run_test "single codex prints ipinfo and runs after yes"     t_single_codex_prints_ipinfo_and_runs_after_yes
 run_test "single claude runs after yes"                      t_single_claude_runs_after_yes
-run_test "confirmation defaults to no"                       t_confirmation_defaults_to_no
+run_test "confirmation defaults to yes"                      t_confirmation_defaults_to_yes
+run_test "confirmation no cancels"                           t_confirmation_no_cancels
 run_test "selector Enter chooses first CLI"                  t_selector_enter_chooses_first_cli
 run_test "selector Down+Enter chooses second CLI"            t_selector_down_enter_chooses_second_cli
 run_test "selector q cancels"                                t_selector_q_cancels
@@ -493,8 +549,10 @@ run_test "bundle symlink skills are discovered and grouped"  t_bundle_symlink_sk
 run_test "codex unchecked skill uses skills.config"          t_codex_unchecked_skill_uses_skills_config_override
 run_test "claude unchecked skill creates local .claude"       t_claude_unchecked_skill_creates_local_claude_after_confirm
 run_test "claude local .claude creation requires confirm"     t_claude_unchecked_skill_requires_local_claude_confirmation
+run_test "claude local .claude creation defaults to yes"      t_claude_local_claude_creation_defaults_to_yes
 run_test "claude temp config inherits global non-skill files" t_claude_temp_config_inherits_global_non_skill_files
 run_test "claude unchecked plugin creates temp plugins"       t_claude_unchecked_plugin_creates_temp_plugins_without_disabled_plugin
+run_test "installer creates agent-launch and al"              t_installer_creates_agent_launch_commands
 
 echo
 echo "===================="

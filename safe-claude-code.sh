@@ -396,10 +396,10 @@ confirm_claude_session_dir() {
   local answer
 
   echo >&2
-  printf 'Create temporary .claude in %s for this Claude session? [y/N] ' "$PWD" >&2
+  printf 'Create temporary .claude in %s for this Claude session? [Y/n] ' "$PWD" >&2
   IFS= read -r answer || cancel
   case "$(trim "$answer")" in
-    y|Y|yes|YES|Yes) ;;
+    ""|y|Y|yes|YES|Yes) ;;
     *) cancel ;;
   esac
 }
@@ -561,7 +561,7 @@ confirm_launch() {
   echo "IPinfo response:" >&2
   printf '%s\n' "$resp" >&2
   echo >&2
-  printf 'Continue and launch %s? [y/N] ' "$SELECTED_CLI" >&2
+  printf 'Continue and launch %s? [Y/n] ' "$SELECTED_CLI" >&2
 
   if [[ ! -t 0 && "${SCC_ALLOW_NON_TTY:-}" != "1" ]]; then
     echo >&2
@@ -570,7 +570,7 @@ confirm_launch() {
 
   IFS= read -r answer || cancel
   case "$(trim "$answer")" in
-    y|Y|yes|YES|Yes) ;;
+    ""|y|Y|yes|YES|Yes) ;;
     *) cancel ;;
   esac
 }
