@@ -2,7 +2,6 @@
 set -euo pipefail
 
 API_URL="${SCC_API:-https://ipinfo.io}"
-CLAUDE_SESSION_DIR="$PWD/.claude"
 
 deny() {
   echo "❌ $1" >&2
@@ -83,6 +82,16 @@ add_feature() {
   feature_groups+=("$1")
   feature_selected+=("1")
   FEATURE_COUNT=$((FEATURE_COUNT + 1))
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
 }
 
 group_index() {
@@ -624,122 +633,53 @@ build_codex_feature_args() {
   fi
 }
 
-has_disabled_features() {
-  local i
-  for i in "${!feature_selected[@]}"; do
-    [[ "${feature_selected[$i]}" == "0" ]] && return 0
-  done
-  return 1
-}
+build_claude_feature_args() {
+  local i type name settings skill_overrides enabled_plugins skill_name plugin_key marketplace plugin
+  cli_extra_args=()
+  skill_overrides=""
+  enabled_plugins=""
 
-confirm_claude_session_dir() {
-  local answer
-
-  echo >&2
-  printf 'Create temporary .claude in %s for this Claude session? [Y/n] ' "$PWD" >&2
-  IFS= read -r answer || cancel
-  case "$(trim "$answer")" in
-    ""|y|Y|yes|YES|Yes) ;;
-    *) cancel ;;
-  esac
-}
-
-inherit_claude_global_config() {
-  local global_dir="$HOME/.claude" entry name
-  [[ -d "$global_dir" ]] || return 0
-
-  while IFS= read -r entry; do
-    name="$(basename "$entry")"
-    [[ "$name" == "skills" || "$name" == "plugins" ]] && continue
-    ln -s "$entry" "$CLAUDE_SESSION_DIR/$name"
-  done < <(find "$global_dir" -mindepth 1 -maxdepth 1 2>/dev/null | sort)
-
-  if [[ -e "$HOME/.claude.json" ]]; then
-    ln -s "$HOME/.claude.json" "$CLAUDE_SESSION_DIR/.claude.json"
-  fi
-}
-
-claude_plugin_disabled_by_path() {
-  local path="$1" i
   for i in "${!feature_names[@]}"; do
-    [[ "${feature_types[$i]}" == "plugin" ]] || continue
-    [[ "${feature_paths[$i]}" == "$path" ]] || continue
-    [[ "${feature_selected[$i]}" == "0" ]]
-    return
-  done
-  return 1
-}
-
-prepare_claude_plugins() {
-  local global_plugins="$HOME/.claude/plugins"
-  local global_marketplaces="$global_plugins/marketplaces"
-  local target_plugins="$CLAUDE_SESSION_DIR/plugins"
-  local entry marketplace_dir marketplace_name section_dir section plugin_dir plugin_name plugin_real target_dir
-  [[ -d "$global_plugins" ]] || return 0
-
-  mkdir -p "$target_plugins"
-  while IFS= read -r entry; do
-    [[ "$(basename "$entry")" == "marketplaces" ]] && continue
-    ln -s "$entry" "$target_plugins/$(basename "$entry")"
-  done < <(find "$global_plugins" -mindepth 1 -maxdepth 1 2>/dev/null | sort)
-
-  [[ -d "$global_marketplaces" ]] || return 0
-  mkdir -p "$target_plugins/marketplaces"
-  while IFS= read -r marketplace_dir; do
-    marketplace_name="$(basename "$marketplace_dir")"
-    mkdir -p "$target_plugins/marketplaces/$marketplace_name"
-    while IFS= read -r entry; do
-      case "$(basename "$entry")" in
-        plugins|external_plugins) continue ;;
-      esac
-      ln -s "$entry" "$target_plugins/marketplaces/$marketplace_name/$(basename "$entry")"
-    done < <(find "$marketplace_dir" -mindepth 1 -maxdepth 1 2>/dev/null | sort)
-  done < <(find "$global_marketplaces" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
-
-  while IFS= read -r section_dir; do
-    section="$(basename "$section_dir")"
-    marketplace_dir="$(dirname "$section_dir")"
-    marketplace_name="$(basename "$marketplace_dir")"
-    target_dir="$target_plugins/marketplaces/$marketplace_name/$section"
-    mkdir -p "$target_dir"
-    while IFS= read -r plugin_dir; do
-      plugin_name="$(basename "$plugin_dir")"
-      plugin_real="$(resolve_dir "$plugin_dir")"
-      [[ -n "$plugin_real" ]] || continue
-      claude_plugin_disabled_by_path "$plugin_real" && continue
-      ln -s "$plugin_real" "$target_dir/$plugin_name"
-    done < <(find -L "$section_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
-  done < <(find "$global_marketplaces" -mindepth 2 -maxdepth 2 -type d \( -name plugins -o -name external_plugins \) 2>/dev/null | sort)
-}
-
-prepare_claude_session_dir() {
-  local i type name path target
-
-  if ! has_disabled_features; then
-    return
-  fi
-
-  confirm_claude_session_dir
-  [[ ! -e "$CLAUDE_SESSION_DIR" ]] || deny "$CLAUDE_SESSION_DIR already exists; refusing to overwrite it."
-
-  mkdir -p "$CLAUDE_SESSION_DIR"
-  inherit_claude_global_config
-  mkdir -p "$CLAUDE_SESSION_DIR/skills"
-  prepare_claude_plugins
-  CLAUDE_TEMP_CONFIG_CREATED=1
-  for i in "${!feature_names[@]}"; do
-    [[ "${feature_selected[$i]}" == "1" ]] || continue
+    [[ "${feature_selected[$i]}" == "0" ]] || continue
     type="${feature_types[$i]}"
     name="${feature_names[$i]}"
-    path="${feature_paths[$i]}"
-    if [[ "$type" == "skill" && -d "$path" ]]; then
-      target="$CLAUDE_SESSION_DIR/skills/$name"
-      mkdir -p "$(dirname "$target")"
-      ln -s "$path" "$target"
-    fi
+    case "$type" in
+      skill)
+        skill_name="$(json_escape "$name")"
+        if [[ -n "$skill_overrides" ]]; then
+          skill_overrides+=","
+        fi
+        skill_overrides+="\"$skill_name\":\"off\""
+        ;;
+      plugin)
+        if [[ "$name" == *:* ]]; then
+          marketplace="${name%%:*}"
+          plugin="${name#*:}"
+          plugin_key="$(json_escape "$plugin@$marketplace")"
+        else
+          plugin_key="$(json_escape "$name")"
+        fi
+        if [[ -n "$enabled_plugins" ]]; then
+          enabled_plugins+=","
+        fi
+        enabled_plugins+="\"$plugin_key\":false"
+        ;;
+    esac
   done
 
-  export CLAUDE_CONFIG_DIR="$CLAUDE_SESSION_DIR"
+  settings=""
+  if [[ -n "$skill_overrides" ]]; then
+    settings+="\"skillOverrides\":{$skill_overrides}"
+  fi
+  if [[ -n "$enabled_plugins" ]]; then
+    if [[ -n "$settings" ]]; then
+      settings+=","
+    fi
+    settings+="\"enabledPlugins\":{$enabled_plugins}"
+  fi
+  if [[ -n "$settings" ]]; then
+    cli_extra_args=("--settings" "{$settings}")
+  fi
 }
 
 select_cli() {
@@ -815,12 +755,29 @@ confirm_launch() {
   esac
 }
 
+print_launch_command() {
+  local arg first=1
+  printf 'Launch command:' >&2
+  for arg in "$@"; do
+    if (( first )); then
+      first=0
+    fi
+    printf ' ' >&2
+    printf '%q' "$arg" >&2
+  done
+  printf '\n' >&2
+}
+
+debug_enabled() {
+  case "${AL_DEBUG:-}" in
+    ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 detect_clis
 select_cli
 select_features
-if [[ "$SELECTED_CLI" == "claude" ]]; then
-  prepare_claude_session_dir
-fi
 
 resp="$(curl -fsS --max-time 5 "$API_URL")" || deny "Failed to fetch $API_URL"
 [[ "$(trim "$resp")" == \{* ]] || deny "Invalid JSON from $API_URL" "$resp"
@@ -828,17 +785,13 @@ resp="$(curl -fsS --max-time 5 "$API_URL")" || deny "Failed to fetch $API_URL"
 confirm_launch
 
 cli_extra_args=()
-if [[ "$SELECTED_CLI" == "codex" ]]; then
-  build_codex_feature_args
-fi
+case "$SELECTED_CLI" in
+  codex)  build_codex_feature_args ;;
+  claude) build_claude_feature_args ;;
+esac
 
-if [[ "${CLAUDE_TEMP_CONFIG_CREATED:-0}" == "1" ]]; then
-  set +e
-  "$SELECTED_CLI" ${cli_extra_args[@]+"${cli_extra_args[@]}"} "$@"
-  rc=$?
-  set -e
-  rm -rf "$CLAUDE_SESSION_DIR"
-  exit "$rc"
+if debug_enabled; then
+  print_launch_command "$SELECTED_CLI" ${cli_extra_args[@]+"${cli_extra_args[@]}"} "$@"
 fi
 
 exec "$SELECTED_CLI" ${cli_extra_args[@]+"${cli_extra_args[@]}"} "$@"

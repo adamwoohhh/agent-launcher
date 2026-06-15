@@ -20,6 +20,7 @@ FAILED=()
 setup_env() {
   TMP="$(mktemp -d)"
   rm -rf ".claude"
+  rm -rf ".temp"
   mkdir -p "$TMP/bin"
   export HOME="$TMP/home"
   mkdir -p "$HOME"
@@ -62,6 +63,7 @@ EOF
 cleanup_env() {
   rm -rf "$TMP"
   rm -rf ".claude"
+  rm -rf ".temp"
 }
 
 add_fake_cli() {
@@ -104,6 +106,12 @@ if [[ -n "\${CLAUDE_CONFIG_DIR:-}" ]]; then
       printf '\n'
     fi
   } > "$log.inherited"
+  sibling_config="\$(dirname "\$CLAUDE_CONFIG_DIR")/.claude.json"
+  if [[ -f "\$sibling_config" ]]; then
+    cat "\$sibling_config" > "$log.sibling_claude_json"
+  else
+    : > "$log.sibling_claude_json"
+  fi
 fi
 printf '%s\n' "\$@" > "$log"
 echo MOCK_${name}_CALLED
@@ -577,78 +585,126 @@ t_codex_unchecked_skill_uses_skills_config_override() {
   assert_eq "$got_env" "" "Codex skill disable should not use temporary CODEX_HOME"
 }
 
-t_claude_unchecked_skill_creates_local_claude_after_confirm() {
+t_claude_unchecked_skill_uses_settings_override() {
   add_fake_cli claude "$CLAUDE_LOG"
   setup_claude_skills
   export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
-  out="$(printf ' \n''y\n''y\n' | bash "$MAIN" 2>&1)"
-  assert_contains "$out" "Create temporary .claude" || return 1
+  out="$(printf ' \n''y\n' | bash "$MAIN" 2>&1)"
   assert_contains "$out" "MOCK_claude_CALLED" || return 1
-  skill_log="$(cat "$CLAUDE_LOG.skills")"
-  assert_not_contains "$skill_log" "/alpha/SKILL.md" "disabled skill alpha was copied" || return 1
-  assert_contains "$skill_log" "/beta/SKILL.md" "enabled skill beta was not available" || return 1
-  skill_links="$(cat "$CLAUDE_LOG.skill_links")"
-  beta_skill_dir="$(real_path "$HOME/.claude/skills/beta")"
-  assert_contains "$skill_links" "$PWD/.claude/skills/beta -> $beta_skill_dir" "enabled skill beta should be symlinked from global config" || return 1
+  got="$(cat "$CLAUDE_LOG")"
+  want="$(printf '%s\n' \
+    "--settings" \
+    '{"skillOverrides":{"alpha":"off"}}')"
+  assert_eq "$got" "$want" "disabled Claude skill should use --settings skillOverrides" || return 1
   got_env="$(cat "$CLAUDE_LOG.env")"
-  assert_eq "$got_env" "$PWD/.claude" "Claude was not launched with local CLAUDE_CONFIG_DIR"
-  [[ ! -d ".claude" ]] || { echo "    temporary .claude was not cleaned up" >&2; rm -rf ".claude"; return 1; }
+  assert_eq "$got_env" "" "Claude settings override should not use CLAUDE_CONFIG_DIR" || return 1
+  [[ ! -d ".temp/.claude" ]] || { echo "    .temp/.claude should not be created for Claude settings override" >&2; rm -rf ".temp"; return 1; }
 }
 
-t_claude_unchecked_skill_requires_local_claude_confirmation() {
+t_claude_unchecked_skill_preserves_user_args() {
   add_fake_cli claude "$CLAUDE_LOG"
   setup_claude_skills
   export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
-  out="$(printf ' \n''n\n' | bash "$MAIN" 2>&1)"
-  local rc=$?
-  assert_eq "$rc" "1" || return 1
-  assert_contains "$out" "Create temporary .claude" || return 1
-  assert_not_contains "$out" "MOCK_claude_CALLED" || return 1
-  [[ ! -d ".claude" ]] || { echo "    .claude should not be created when user declines" >&2; rm -rf ".claude"; return 1; }
-}
-
-t_claude_local_claude_creation_defaults_to_yes() {
-  add_fake_cli claude "$CLAUDE_LOG"
-  setup_claude_skills
-  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
-  out="$(printf ' \n''\n''\n' | bash "$MAIN" 2>&1)"
-  assert_contains "$out" "Create temporary .claude" || return 1
+  out="$(printf ' \n''y\n' | bash "$MAIN" --model sonnet 2>&1)"
   assert_contains "$out" "MOCK_claude_CALLED" || return 1
-  got_env="$(cat "$CLAUDE_LOG.env")"
-  assert_eq "$got_env" "$PWD/.claude" "Claude was not launched with local CLAUDE_CONFIG_DIR"
-  [[ ! -d ".claude" ]] || { echo "    temporary .claude was not cleaned up" >&2; rm -rf ".claude"; return 1; }
+  got="$(cat "$CLAUDE_LOG")"
+  want="$(printf '%s\n' \
+    "--settings" \
+    '{"skillOverrides":{"alpha":"off"}}' \
+    "--model" \
+    "sonnet")"
+  assert_eq "$got" "$want" "Claude --settings should be prepended before forwarded args"
 }
 
-t_claude_temp_config_inherits_global_non_skill_files() {
-  add_fake_cli claude "$CLAUDE_LOG"
-  setup_claude_global_config
-  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
-  out="$(printf ' \n''y\n''y\n' | bash "$MAIN" 2>&1)"
-  assert_contains "$out" "MOCK_claude_CALLED" || return 1
-  inherited="$(cat "$CLAUDE_LOG.inherited")"
-  assert_contains "$inherited" "auth.json=auth-token" "global auth was not available in temporary .claude" || return 1
-  assert_contains "$inherited" 'settings.json={"theme":"dark"}' "global settings were not available in temporary .claude" || return 1
-  assert_contains "$inherited" "projects/current.json=project-state" "global project state was not available in temporary .claude" || return 1
-  assert_contains "$inherited" "cache/token.txt=cached-token" "global cache was not available in temporary .claude" || return 1
-  assert_contains "$inherited" '.claude.json={"account":"logged-in"}' "global Claude account file was not available in temporary .claude" || return 1
-  [[ ! -d ".claude" ]] || { echo "    temporary .claude was not cleaned up" >&2; rm -rf ".claude"; return 1; }
-}
-
-t_claude_unchecked_plugin_creates_temp_plugins_without_disabled_plugin() {
+t_claude_unchecked_plugin_uses_enabled_plugins_setting() {
   add_fake_cli claude "$CLAUDE_LOG"
   setup_claude_skills
   setup_claude_plugins
   export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
-  out="$(printf '\033[B\033[B\033[B \n''y\n''y\n' | bash "$MAIN" 2>&1)"
-  assert_contains "$out" "official:plugin-alpha" || return 1
-  assert_contains "$out" "official:plugin-beta" || return 1
+  out="$(printf '\033[B\033[B\033[B \n''y\n' | bash "$MAIN" 2>&1)"
   assert_contains "$out" "MOCK_claude_CALLED" || return 1
-  plugin_log="$(cat "$CLAUDE_LOG.plugins")"
-  assert_not_contains "$plugin_log" "/plugin-alpha" "disabled plugin alpha was available in temporary .claude" || return 1
-  assert_contains "$plugin_log" "/plugin-beta" "enabled plugin beta was not available in temporary .claude" || return 1
-  assert_contains "$plugin_log" "/plugin-gamma" "unlisted plugin gamma should be preserved in temporary .claude" || return 1
-  [[ -d "$HOME/.claude/plugins/marketplaces/official/plugins/plugin-alpha" ]] || { echo "    global disabled plugin should not be deleted" >&2; return 1; }
-  [[ ! -d ".claude" ]] || { echo "    temporary .claude was not cleaned up" >&2; rm -rf ".claude"; return 1; }
+  got="$(cat "$CLAUDE_LOG")"
+  want="$(printf '%s\n' \
+    "--settings" \
+    '{"enabledPlugins":{"plugin-alpha@official":false}}')"
+  assert_eq "$got" "$want" "disabled Claude plugin should use --settings enabledPlugins"
+}
+
+t_claude_existing_project_claude_does_not_block_settings_override() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  setup_claude_skills
+  mkdir -p ".claude"
+  printf '%s' "project-local" > ".claude/project-marker"
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf ' \n''y\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "MOCK_claude_CALLED" || return 1
+  got_env="$(cat "$CLAUDE_LOG.env")"
+  assert_eq "$got_env" "" "Claude settings override should not use CLAUDE_CONFIG_DIR" || return 1
+  assert_eq "$(cat .claude/project-marker)" "project-local" "existing project .claude should be left untouched" || return 1
+  [[ ! -d ".temp/.claude" ]] || { echo "    temporary .temp/.claude was not cleaned up" >&2; rm -rf ".temp"; return 1; }
+}
+
+t_claude_settings_override_does_not_touch_global_non_skill_files() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  setup_claude_global_config
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf ' \n''y\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "MOCK_claude_CALLED" || return 1
+  [[ -f "$HOME/.claude/auth.json" ]] || { echo "    global auth should not be moved or deleted" >&2; return 1; }
+  [[ -f "$HOME/.claude.json" ]] || { echo "    global account file should not be moved or deleted" >&2; return 1; }
+  [[ ! -e ".temp/.claude.json" ]] || { echo "    .temp/.claude.json should not be created for Claude settings override" >&2; rm -rf ".temp"; return 1; }
+}
+
+t_claude_unchecked_skill_and_plugin_merge_settings() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  setup_claude_skills
+  setup_claude_plugins
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf ' \033[B\033[B\033[B \n''y\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "MOCK_claude_CALLED" || return 1
+  got="$(cat "$CLAUDE_LOG")"
+  want="$(printf '%s\n' \
+    "--settings" \
+    '{"skillOverrides":{"alpha":"off"},"enabledPlugins":{"plugin-alpha@official":false}}')"
+  assert_eq "$got" "$want" "Claude disabled skill and plugin settings should be merged into one --settings argument"
+}
+
+t_debug_prints_codex_launch_command() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_codex_resources
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf ' \n''y\n' | AL_DEBUG=1 bash "$MAIN" --foo 2>&1)"
+  alpha_skill="$(real_path "$HOME/.codex/skills/alpha/SKILL.md")"
+  assert_contains "$out" "Launch command:" || return 1
+  assert_contains "$out" "codex" || return 1
+  assert_contains "$out" "skills.config=" || return 1
+  assert_contains "$out" "$alpha_skill" || return 1
+  assert_contains "$out" "--foo" || return 1
+}
+
+t_debug_prints_claude_launch_command() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  setup_claude_skills
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf ' \n''y\n' | AL_DEBUG=1 bash "$MAIN" --model sonnet 2>&1)"
+  assert_contains "$out" "Launch command:" || return 1
+  assert_contains "$out" "claude" || return 1
+  assert_contains "$out" "--settings" || return 1
+  assert_contains "$out" "skillOverrides" || return 1
+  assert_contains "$out" "alpha" || return 1
+  assert_contains "$out" "off" || return 1
+  assert_contains "$out" "--model" || return 1
+}
+
+t_debug_arg_is_forwarded_without_enabling_launcher_debug() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf 'y\n' | bash "$MAIN" --debug 2>&1)"
+  assert_not_contains "$out" "Launch command:" "--debug argument should not enable launcher debug output" || return 1
+  assert_contains "$out" "MOCK_claude_CALLED" || return 1
+  got="$(cat "$CLAUDE_LOG")"
+  want="--debug"
+  assert_eq "$got" "$want" "--debug should still be forwarded as a normal target CLI argument"
 }
 
 t_installer_creates_agent_launch_commands() {
@@ -696,11 +752,15 @@ run_test "feature selector movement updates rows only"       t_feature_selector_
 run_test "feature selector renders max 20 lines"             t_feature_selector_frame_is_limited_to_20_lines
 run_test "Down scrolls feature selector viewport"            t_down_scrolls_feature_selector_viewport
 run_test "codex unchecked skill uses skills.config"          t_codex_unchecked_skill_uses_skills_config_override
-run_test "claude unchecked skill creates local .claude"       t_claude_unchecked_skill_creates_local_claude_after_confirm
-run_test "claude local .claude creation requires confirm"     t_claude_unchecked_skill_requires_local_claude_confirmation
-run_test "claude local .claude creation defaults to yes"      t_claude_local_claude_creation_defaults_to_yes
-run_test "claude temp config inherits global non-skill files" t_claude_temp_config_inherits_global_non_skill_files
-run_test "claude unchecked plugin creates temp plugins"       t_claude_unchecked_plugin_creates_temp_plugins_without_disabled_plugin
+run_test "claude unchecked skill uses --settings"             t_claude_unchecked_skill_uses_settings_override
+run_test "claude unchecked skill preserves args"               t_claude_unchecked_skill_preserves_user_args
+run_test "claude unchecked plugin uses enabledPlugins"         t_claude_unchecked_plugin_uses_enabled_plugins_setting
+run_test "claude existing project .claude does not block"      t_claude_existing_project_claude_does_not_block_settings_override
+run_test "claude settings leaves global config alone"          t_claude_settings_override_does_not_touch_global_non_skill_files
+run_test "claude settings merge skill and plugin disables"     t_claude_unchecked_skill_and_plugin_merge_settings
+run_test "debug prints codex launch command"                  t_debug_prints_codex_launch_command
+run_test "debug prints claude launch command"                 t_debug_prints_claude_launch_command
+run_test "--debug arg is forwarded only"                      t_debug_arg_is_forwarded_without_enabling_launcher_debug
 run_test "installer creates agent-launch and al"              t_installer_creates_agent_launch_commands
 
 echo
