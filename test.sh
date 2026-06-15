@@ -179,6 +179,26 @@ setup_superpowers_bundle_skills() {
   ln -s "$TMP/superpowers" "$HOME/.agents/skills/superpowers"
 }
 
+setup_many_lark_skills() {
+  local i name
+  mkdir -p "$HOME/.agents/skills"
+  for i in 01 02 03 04 05 06; do
+    name="lark-tool-$i"
+    mkdir -p "$HOME/.agents/skills/$name"
+    printf '%s\n' '---' "name: $name" '---' > "$HOME/.agents/skills/$name/SKILL.md"
+  done
+}
+
+setup_many_feature_groups() {
+  local i name
+  mkdir -p "$HOME/.agents/skills"
+  for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18; do
+    name="tool$i-alpha"
+    mkdir -p "$HOME/.agents/skills/$name"
+    printf '%s\n' '---' "name: $name" '---' > "$HOME/.agents/skills/$name/SKILL.md"
+  done
+}
+
 # ---------- assertions ----------
 
 assert_eq() {
@@ -203,6 +223,32 @@ assert_not_contains() {
     printf '    %s\n      needle: %q\n      output: %s\n' "$msg" "$needle" "$hay" >&2
     return 1
   fi
+}
+
+first_feature_selector_frame() {
+  local out="$1"
+  printf '%s' "$out" | awk '
+    /Select features to enable:/ {in_frame=1}
+    in_frame {print}
+    in_frame && /move/ {exit}
+  '
+}
+
+count_occurrences() {
+  local hay="$1" needle="$2"
+  printf '%s' "$hay" | awk -v needle="$needle" '
+  {
+    hay = hay $0 "\n"
+  }
+  END {
+    count = 0
+    start = 1
+    while ((pos = index(substr(hay, start), needle)) > 0) {
+      count++
+      start += pos + length(needle) - 1
+    }
+    print count
+  }'
 }
 
 # ---------- runner ----------
@@ -418,6 +464,101 @@ t_bundle_symlink_skills_are_discovered_and_grouped() {
   assert_eq "$got" "$want" "bundle symlink skills were not discovered or grouped"
 }
 
+t_large_group_is_collapsed_by_default() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_lark_skills
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf 'q' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  frame="$(first_feature_selector_frame "$out")"
+  assert_contains "$frame" $'\033[1mlark\033[0m' || return 1
+  assert_contains "$frame" "collapsed" || return 1
+  assert_not_contains "$frame" "lark-tool-01" "large groups should not show members before expansion"
+}
+
+t_right_arrow_on_collapsed_group_expands_it() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_lark_skills
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\033[Cq' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "lark-tool-01" "Right arrow on a collapsed group should reveal members" || return 1
+  assert_contains "$out" $'\0338\033[J' "selector update should restore and clear the previous frame"
+}
+
+t_left_arrow_on_expanded_group_collapses_it() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_agent_symlink_skills
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\033[A\033[Dq' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "collapsed" "Left arrow on an expanded group should collapse it"
+}
+
+t_enter_on_collapsed_group_continues() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_lark_skills
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\n''y\n' | bash "$MAIN" --foo 2>&1)"
+  assert_contains "$out" "MOCK_codex_CALLED" || return 1
+  assert_not_contains "$out" "lark-tool-01" "Enter should continue instead of expanding collapsed groups" || return 1
+  got="$(cat "$CODEX_LOG")"
+  assert_eq "$got" "--foo" "Enter on a collapsed group should continue to launch without changing selection"
+}
+
+t_feature_selector_redraw_restores_saved_cursor() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_lark_skills
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\033[Cq' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" $'\0337' "feature selector should save its starting cursor position" || return 1
+  assert_contains "$out" $'\0338\033[J' "feature selector redraw should restore cursor and clear old content" || return 1
+  assert_not_contains "$out" $'\033[20A' "feature selector redraw should not rely on moving up a fixed number of rows"
+}
+
+t_feature_selector_movement_updates_rows_without_full_redraw() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_codex_resources
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\033[Bq' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  count="$(count_occurrences "$out" "Select features to enable:")"
+  assert_eq "$count" "1" "plain cursor movement should not redraw the whole selector"
+}
+
+t_feature_selector_frame_is_limited_to_20_lines() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_feature_groups
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf 'q' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  frame="$(first_feature_selector_frame "$out")"
+  line_count="$(printf '%s\n' "$frame" | wc -l | tr -d ' ')"
+  assert_eq "$line_count" "20" "feature selector should render at most 20 lines" || return 1
+  assert_not_contains "$frame" "tool18-alpha" "items beyond the viewport should not be in the first frame"
+}
+
+t_down_scrolls_feature_selector_viewport() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_feature_groups
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  local keys="" i
+  for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34; do
+    keys+=$'\033[B'
+  done
+  out="$(printf '%sq' "$keys" | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "tool18-alpha" "down key should scroll later rows into the selector viewport"
+}
+
 t_codex_unchecked_skill_uses_skills_config_override() {
   add_fake_cli codex "$CODEX_LOG"
   setup_codex_resources
@@ -498,7 +639,7 @@ t_claude_unchecked_plugin_creates_temp_plugins_without_disabled_plugin() {
   setup_claude_skills
   setup_claude_plugins
   export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
-  out="$(printf '\033[B\033[B \n''y\n''y\n' | bash "$MAIN" 2>&1)"
+  out="$(printf '\033[B\033[B\033[B \n''y\n''y\n' | bash "$MAIN" 2>&1)"
   assert_contains "$out" "official:plugin-alpha" || return 1
   assert_contains "$out" "official:plugin-beta" || return 1
   assert_contains "$out" "MOCK_claude_CALLED" || return 1
@@ -546,6 +687,14 @@ run_test "codex reads agent symlink skills real paths"       t_codex_reads_agent
 run_test "feature group toggle disables group members"       t_feature_group_toggle_disables_group_members
 run_test "prefix root skill joins prefixed group"            t_prefix_root_skill_joins_prefixed_group
 run_test "bundle symlink skills are discovered and grouped"  t_bundle_symlink_skills_are_discovered_and_grouped
+run_test "large groups collapse by default"                  t_large_group_is_collapsed_by_default
+run_test "Right expands collapsed group"                     t_right_arrow_on_collapsed_group_expands_it
+run_test "Left collapses expanded group"                     t_left_arrow_on_expanded_group_collapses_it
+run_test "Enter on collapsed group continues"                t_enter_on_collapsed_group_continues
+run_test "feature selector redraw restores saved cursor"     t_feature_selector_redraw_restores_saved_cursor
+run_test "feature selector movement updates rows only"       t_feature_selector_movement_updates_rows_without_full_redraw
+run_test "feature selector renders max 20 lines"             t_feature_selector_frame_is_limited_to_20_lines
+run_test "Down scrolls feature selector viewport"            t_down_scrolls_feature_selector_viewport
 run_test "codex unchecked skill uses skills.config"          t_codex_unchecked_skill_uses_skills_config_override
 run_test "claude unchecked skill creates local .claude"       t_claude_unchecked_skill_creates_local_claude_after_confirm
 run_test "claude local .claude creation requires confirm"     t_claude_unchecked_skill_requires_local_claude_confirmation

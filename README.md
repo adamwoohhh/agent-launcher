@@ -57,18 +57,18 @@ Select CLI to launch:
 ```text
 Select features to enable:
 
-  [x] lark
+  [x] lark (2)
 >   [x] skill   lark-approval
     [x] skill   lark-apps
-  [x] plugin
+  [x] plugin (1)
     [x] plugin  browser@openai-bundled
-  [x] mcp
+  [x] mcp (1)
     [x] mcp     node_repl
 
-↑/↓ move, Space toggle item, g toggle group, Enter continue, a toggle all, q cancel
+↑/↓ move/scroll, ←/→ collapse/expand, Space toggle item, g toggle group, Enter continue, a toggle all, q cancel
 ```
 
-用方向键移动，空格反选单项，`g` 切换当前项所在分组，回车继续，`a` 全选/全不选，`q` 取消。
+用上下方向键移动，左右方向键折叠或展开当前分组，空格反选单项，`g` 切换当前项所在分组，回车继续，`a` 全选/全不选，`q` 取消。超过 5 项的分组会默认折叠。selector 固定最多展示 20 行，超出的内容用方向键滚动查看。
 
 skill 会从通用目录和当前 CLI 专属目录读取：
 

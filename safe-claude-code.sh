@@ -85,6 +85,17 @@ add_feature() {
   FEATURE_COUNT=$((FEATURE_COUNT + 1))
 }
 
+group_index() {
+  local group="$1" i
+  for i in "${!feature_group_names[@]}"; do
+    if [[ "${feature_group_names[$i]}" == "$group" ]]; then
+      printf '%s' "$i"
+      return
+    fi
+  done
+  printf '%s' "-1"
+}
+
 resolve_dir() {
   local dir="$1"
   (cd -P "$dir" 2>/dev/null && pwd)
@@ -210,38 +221,84 @@ assign_feature_groups() {
   done
 }
 
-render_feature_menu() {
-  local selected="$1" i cursor mark previous_group group_state
+print_feature_row() {
+  local row="$1" selected="$2" row_type i cursor mark group group_state size suffix
 
-  if (( FEATURE_MENU_RENDERED_LINES > 0 )); then
-    printf '\033[%dA' "$FEATURE_MENU_RENDERED_LINES" >&2
+  row_type="${visible_row_types[$row]}"
+  group="${visible_row_groups[$row]}"
+  if [[ "$row" == "$selected" ]]; then
+    cursor=">"
+  else
+    cursor=" "
   fi
 
-  printf '\033[?25l' >&2
-  printf 'Select features to enable:\033[K\n\033[K\n' >&2
-
-  previous_group=""
-  for i in "${!feature_names[@]}"; do
-    if [[ "${feature_groups[$i]}" != "$previous_group" ]]; then
-      previous_group="${feature_groups[$i]}"
-      group_state="$(group_mark "$previous_group")"
-      printf '  %s \033[1m%s\033[0m\033[K\n' "$group_state" "$previous_group" >&2
-    fi
-    if [[ "$i" == "$selected" ]]; then
-      cursor=">"
+  if [[ "$row_type" == "group" ]]; then
+    group_state="$(group_mark "$group")"
+    size="$(group_size "$group")"
+    if group_collapsed "$group"; then
+      suffix=" ($size, collapsed)"
     else
-      cursor=" "
+      suffix=" ($size)"
     fi
+    printf '%s %s \033[1m%s\033[0m%s\033[K' "$cursor" "$group_state" "$group" "$suffix" >&2
+  else
+    i="${visible_row_feature_indexes[$row]}"
     if [[ "${feature_selected[$i]}" == "1" ]]; then
       mark="[x]"
     else
       mark="[ ]"
     fi
-    printf '%s   %s %-7s %s\033[K\n' "$cursor" "$mark" "${feature_types[$i]}" "${feature_names[$i]}" >&2
+    printf '%s   %s %-7s %s\033[K' "$cursor" "$mark" "${feature_types[$i]}" "${feature_names[$i]}" >&2
+  fi
+}
+
+render_feature_row_at() {
+  local row="$1" selected="$2" screen_row
+
+  if (( row < FEATURE_MENU_SCROLL || row >= FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES )); then
+    return
+  fi
+
+  screen_row=$((2 + row - FEATURE_MENU_SCROLL))
+  printf '\0338\033[%dB' "$screen_row" >&2
+  print_feature_row "$row" "$selected"
+}
+
+finish_feature_partial_render() {
+  printf '\0338\033[%dB' "$FEATURE_MENU_MAX_LINES" >&2
+}
+
+render_feature_menu() {
+  local selected="$1" row end_row
+
+  if (( FEATURE_MENU_RENDERED_LINES > 0 )); then
+    printf '\0338\033[J' >&2
+  else
+    printf '\0337' >&2
+  fi
+
+  build_visible_feature_rows
+  adjust_feature_scroll
+
+  printf '\033[?25l' >&2
+  printf 'Select features to enable:\033[K\n\033[K\n' >&2
+
+  end_row=$((FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES))
+  if (( end_row > VISIBLE_ROW_COUNT )); then
+    end_row="$VISIBLE_ROW_COUNT"
+  fi
+
+  for (( row = FEATURE_MENU_SCROLL; row < end_row; row++ )); do
+    print_feature_row "$row" "$selected"
+    printf '\n' >&2
   done
 
-  printf '\033[K\n↑/↓ move, Space toggle item, g toggle group, Enter continue, a toggle all, q cancel\033[K\n' >&2
-  FEATURE_MENU_RENDERED_LINES=$((FEATURE_COUNT + GROUP_COUNT + 4))
+  for (( ; row < FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES; row++ )); do
+    printf '\033[K\n' >&2
+  done
+
+  printf '\033[K\n↑/↓ move/scroll, ←/→ collapse/expand, Space toggle item, g toggle group, Enter continue, a toggle all, q cancel\033[K\n' >&2
+  FEATURE_MENU_RENDERED_LINES=1
 }
 
 group_mark() {
@@ -271,6 +328,137 @@ count_groups() {
   GROUP_COUNT="$count"
 }
 
+initialize_feature_menu_groups() {
+  local i group idx
+  feature_group_names=()
+  feature_group_sizes=()
+  feature_group_collapsed=()
+
+  for i in "${!feature_names[@]}"; do
+    group="${feature_groups[$i]}"
+    idx="$(group_index "$group")"
+    if (( idx < 0 )); then
+      feature_group_names+=("$group")
+      feature_group_sizes+=("1")
+      feature_group_collapsed+=("0")
+    else
+      feature_group_sizes[$idx]=$((feature_group_sizes[$idx] + 1))
+    fi
+  done
+
+  for i in "${!feature_group_names[@]}"; do
+    if (( feature_group_sizes[$i] > 5 )); then
+      feature_group_collapsed[$i]="1"
+    fi
+  done
+}
+
+group_size() {
+  local idx
+  idx="$(group_index "$1")"
+  if (( idx >= 0 )); then
+    printf '%s' "${feature_group_sizes[$idx]}"
+  else
+    printf '%s' "0"
+  fi
+}
+
+group_collapsed() {
+  local idx
+  idx="$(group_index "$1")"
+  [[ "$idx" != "-1" && "${feature_group_collapsed[$idx]}" == "1" ]]
+}
+
+toggle_group_collapsed() {
+  local idx
+  idx="$(group_index "$1")"
+  (( idx >= 0 )) || return
+  if [[ "${feature_group_collapsed[$idx]}" == "1" ]]; then
+    feature_group_collapsed[$idx]="0"
+  else
+    feature_group_collapsed[$idx]="1"
+  fi
+}
+
+collapse_group() {
+  local idx
+  idx="$(group_index "$1")"
+  (( idx >= 0 )) || return 1
+  [[ "${feature_group_collapsed[$idx]}" == "1" ]] && return 1
+  feature_group_collapsed[$idx]="1"
+}
+
+expand_group() {
+  local idx
+  idx="$(group_index "$1")"
+  (( idx >= 0 )) || return 1
+  [[ "${feature_group_collapsed[$idx]}" == "0" ]] && return 1
+  feature_group_collapsed[$idx]="0"
+}
+
+build_visible_feature_rows() {
+  local i previous_group="" group
+  visible_row_types=()
+  visible_row_feature_indexes=()
+  visible_row_groups=()
+
+  for i in "${!feature_names[@]}"; do
+    group="${feature_groups[$i]}"
+    if [[ "$group" != "$previous_group" ]]; then
+      previous_group="$group"
+      visible_row_types+=("group")
+      visible_row_feature_indexes+=("-1")
+      visible_row_groups+=("$group")
+    fi
+
+    if ! group_collapsed "$group"; then
+      visible_row_types+=("item")
+      visible_row_feature_indexes+=("$i")
+      visible_row_groups+=("$group")
+    fi
+  done
+  VISIBLE_ROW_COUNT="${#visible_row_types[@]}"
+}
+
+first_visible_item_row() {
+  local i
+  for i in "${!visible_row_types[@]}"; do
+    if [[ "${visible_row_types[$i]}" == "item" ]]; then
+      printf '%s' "$i"
+      return
+    fi
+  done
+  printf '%s' "0"
+}
+
+initial_feature_row() {
+  if [[ "${visible_row_types[0]}" == "group" ]] && group_collapsed "${visible_row_groups[0]}"; then
+    printf '%s' "0"
+  else
+    first_visible_item_row
+  fi
+}
+
+clamp_feature_cursor() {
+  if (( selected_row < 0 )); then
+    selected_row=0
+  elif (( selected_row >= VISIBLE_ROW_COUNT )); then
+    selected_row=$((VISIBLE_ROW_COUNT - 1))
+  fi
+}
+
+adjust_feature_scroll() {
+  clamp_feature_cursor
+  if (( selected_row < FEATURE_MENU_SCROLL )); then
+    FEATURE_MENU_SCROLL="$selected_row"
+  elif (( selected_row >= FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES )); then
+    FEATURE_MENU_SCROLL=$((selected_row - FEATURE_MENU_BODY_LINES + 1))
+  fi
+  if (( FEATURE_MENU_SCROLL < 0 )); then
+    FEATURE_MENU_SCROLL=0
+  fi
+}
+
 toggle_group() {
   local group="$1" i any_selected=0
   for i in "${!feature_names[@]}"; do
@@ -288,44 +476,95 @@ toggle_group() {
 }
 
 select_features() {
-  local selected=0 key i any_selected
+  local selected_row=0 key i any_selected row_type feature_index group
+  local needs_full_render=1 old_selected_row old_scroll
 
   discover_features
   if (( FEATURE_COUNT == 0 )); then
     return
   fi
   count_groups
+  initialize_feature_menu_groups
+  build_visible_feature_rows
+  selected_row="$(initial_feature_row)"
 
   if [[ ! -t 0 && "${SCC_ALLOW_NON_TTY:-}" != "1" ]]; then
     deny "Interactive feature selection requires a TTY."
   fi
 
+  FEATURE_MENU_MAX_LINES=20
+  FEATURE_MENU_BODY_LINES=$((FEATURE_MENU_MAX_LINES - 4))
+  FEATURE_MENU_SCROLL=0
   FEATURE_MENU_RENDERED_LINES=0
   trap 'restore_cursor; echo >&2; exit 130' INT TERM
   while true; do
-    render_feature_menu "$selected"
+    if (( needs_full_render )); then
+      render_feature_menu "$selected_row"
+      needs_full_render=0
+    fi
     key="$(read_key)" || { restore_cursor; echo >&2; cancel; }
+    row_type="${visible_row_types[$selected_row]}"
+    feature_index="${visible_row_feature_indexes[$selected_row]}"
+    group="${visible_row_groups[$selected_row]}"
 
     case "$key" in
       $'\e[A')
-        if (( selected == 0 )); then
-          selected=$((FEATURE_COUNT - 1))
+        old_selected_row="$selected_row"
+        old_scroll="$FEATURE_MENU_SCROLL"
+        if (( selected_row == 0 )); then
+          selected_row=$((VISIBLE_ROW_COUNT - 1))
         else
-          selected=$((selected - 1))
+          selected_row=$((selected_row - 1))
+        fi
+        adjust_feature_scroll
+        if (( FEATURE_MENU_SCROLL == old_scroll )); then
+          render_feature_row_at "$old_selected_row" "$selected_row"
+          render_feature_row_at "$selected_row" "$selected_row"
+          finish_feature_partial_render
+        else
+          needs_full_render=1
         fi
         ;;
       $'\e[B')
-        selected=$(((selected + 1) % FEATURE_COUNT))
-        ;;
-      " ")
-        if [[ "${feature_selected[$selected]}" == "1" ]]; then
-          feature_selected[$selected]="0"
+        old_selected_row="$selected_row"
+        old_scroll="$FEATURE_MENU_SCROLL"
+        selected_row=$(((selected_row + 1) % VISIBLE_ROW_COUNT))
+        adjust_feature_scroll
+        if (( FEATURE_MENU_SCROLL == old_scroll )); then
+          render_feature_row_at "$old_selected_row" "$selected_row"
+          render_feature_row_at "$selected_row" "$selected_row"
+          finish_feature_partial_render
         else
-          feature_selected[$selected]="1"
+          needs_full_render=1
         fi
         ;;
+      $'\e[D')
+        if [[ "$row_type" == "group" ]] && collapse_group "$group"; then
+          build_visible_feature_rows
+          clamp_feature_cursor
+          needs_full_render=1
+        fi
+        ;;
+      $'\e[C')
+        if [[ "$row_type" == "group" ]] && expand_group "$group"; then
+          build_visible_feature_rows
+          clamp_feature_cursor
+          needs_full_render=1
+        fi
+        ;;
+      " ")
+        if [[ "$row_type" == "item" ]]; then
+          if [[ "${feature_selected[$feature_index]}" == "1" ]]; then
+            feature_selected[$feature_index]="0"
+          else
+            feature_selected[$feature_index]="1"
+          fi
+        fi
+        needs_full_render=1
+        ;;
       g|G)
-        toggle_group "${feature_groups[$selected]}"
+        toggle_group "$group"
+        needs_full_render=1
         ;;
       a|A)
         any_selected=0
@@ -339,6 +578,7 @@ select_features() {
             feature_selected[$i]="1"
           fi
         done
+        needs_full_render=1
         ;;
       "")
         restore_cursor
