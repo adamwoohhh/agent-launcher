@@ -145,11 +145,6 @@ discover_codex_config_resources() {
       plugin="${BASH_REMATCH[1]}"
       continue
     fi
-    if [[ "$line" =~ ^\[mcp_servers\.([A-Za-z0-9_-]+)\]$ ]]; then
-      add_feature "mcp" "${BASH_REMATCH[1]}" "$config"
-      plugin=""
-      continue
-    fi
     if [[ -n "$plugin" && "$line" =~ ^enabled[[:space:]]*=[[:space:]]*true[[:space:]]*$ ]]; then
       add_feature "plugin" "$plugin" "$config"
       plugin=""
@@ -177,6 +172,50 @@ discover_claude_plugins() {
   done < <(find -L "$root" -mindepth 5 -maxdepth 5 -path '*/.claude-plugin/plugin.json' -type f 2>/dev/null | sort)
 }
 
+feature_type_rank() {
+  case "$1" in
+    skill) printf '%s' "0" ;;
+    plugin) printf '%s' "1" ;;
+    *) printf '%s' "9" ;;
+  esac
+}
+
+feature_base_name() {
+  local type="$1" name="$2"
+  if [[ "$type" == "plugin" && "$name" == *:* ]]; then
+    printf '%s' "${name#*:}"
+  else
+    printf '%s' "$name"
+  fi
+}
+
+sort_features() {
+  local sorted line type name path selected rank sort_name
+  sorted="$(for i in "${!feature_names[@]}"; do
+    type="${feature_types[$i]}"
+    name="${feature_names[$i]}"
+    rank="$(feature_type_rank "$type")"
+    sort_name="$(feature_base_name "$type" "$name")"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rank" "$sort_name" "$type" "$name" "${feature_paths[$i]}" "${feature_selected[$i]}"
+  done | LC_ALL=C sort -t $'\t' -k1,1n -k2,2 -k4,4)"
+
+  feature_types=()
+  feature_names=()
+  feature_paths=()
+  feature_groups=()
+  feature_selected=()
+
+  while IFS=$'\t' read -r _ _ type name path selected; do
+    [[ -n "$type" ]] || continue
+    feature_types+=("$type")
+    feature_names+=("$name")
+    feature_paths+=("$path")
+    feature_groups+=("$type")
+    feature_selected+=("$selected")
+  done <<< "$sorted"
+  FEATURE_COUNT="${#feature_names[@]}"
+}
+
 discover_features() {
   feature_types=()
   feature_names=()
@@ -192,42 +231,63 @@ discover_features() {
       discover_codex_config_resources
       ;;
     claude)
-      discover_skill_dir "$HOME/.agents/skills"
       discover_skill_dir "$HOME/.claude/skills"
       discover_claude_plugins
       ;;
   esac
+  sort_features
   assign_feature_groups
 }
 
-prefix_exists() {
-  local prefix="$1" i
+prefix_match_count() {
+  local type="$1" prefix="$2" i base count=0
   for i in "${!feature_names[@]}"; do
-    if [[ "${feature_types[$i]}" == "skill" && "${feature_names[$i]}" == "$prefix-"* ]]; then
-      return 0
+    [[ "${feature_types[$i]}" == "$type" ]] || continue
+    if [[ "$type" == "skill" && "${feature_names[$i]}" == "$prefix:"* ]]; then
+      count=$((count + 1))
+      continue
+    fi
+    base="$(feature_base_name "${feature_types[$i]}" "${feature_names[$i]}")"
+    if [[ "$base" == "$prefix" || "$base" == "$prefix-"* ]]; then
+      count=$((count + 1))
     fi
   done
-  return 1
+  printf '%s' "$count"
 }
 
 assign_feature_groups() {
-  local i name prefix
+  local i type name base prefix matches
   for i in "${!feature_names[@]}"; do
+    type="${feature_types[$i]}"
     name="${feature_names[$i]}"
-    if [[ "${feature_types[$i]}" == "skill" ]]; then
-      if [[ "$name" == *:* ]]; then
-        feature_groups[$i]="${name%%:*}"
-      elif [[ "$name" == *-* ]]; then
-        feature_groups[$i]="${name%%-*}"
-      elif prefix_exists "$name"; then
-        feature_groups[$i]="$name"
+    base="$(feature_base_name "$type" "$name")"
+    if [[ "$type" == "skill" || "$type" == "plugin" ]]; then
+      if [[ "$type" == "skill" && "$name" == *:* ]]; then
+        prefix="${name%%:*}"
+      elif [[ "$base" == *-* ]]; then
+        prefix="${base%%-*}"
       else
-        feature_groups[$i]="skill"
+        prefix="$base"
+      fi
+      matches="$(prefix_match_count "$type" "$prefix")"
+      if (( matches > 1 )); then
+        feature_groups[$i]="$type:$prefix"
+      else
+        feature_groups[$i]="$type"
       fi
     else
-      feature_groups[$i]="${feature_types[$i]}"
+      feature_groups[$i]="$type"
     fi
   done
+}
+
+group_label() {
+  local group="$1"
+  if [[ "$group" == skill:* || "$group" == plugin:* ]]; then
+    printf '%s' "${group#*:}"
+  else
+    printf '%s' "$group"
+  fi
 }
 
 print_feature_row() {
@@ -249,7 +309,7 @@ print_feature_row() {
     else
       suffix=" ($size)"
     fi
-    printf '%s %s \033[1m%s\033[0m%s\033[K' "$cursor" "$group_state" "$group" "$suffix" >&2
+    printf '%s %s \033[1m%s\033[0m%s\033[K' "$cursor" "$group_state" "$(group_label "$group")" "$suffix" >&2
   else
     i="${visible_row_feature_indexes[$row]}"
     if [[ "${feature_selected[$i]}" == "1" ]]; then
@@ -275,6 +335,29 @@ render_feature_row_at() {
 
 finish_feature_partial_render() {
   printf '\0338\033[%dB' "$FEATURE_MENU_MAX_LINES" >&2
+}
+
+render_feature_body() {
+  local selected="$1" row end_row
+
+  build_visible_feature_rows
+  adjust_feature_scroll
+
+  end_row=$((FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES))
+  if (( end_row > VISIBLE_ROW_COUNT )); then
+    end_row="$VISIBLE_ROW_COUNT"
+  fi
+
+  for (( row = FEATURE_MENU_SCROLL; row < end_row; row++ )); do
+    printf '\0338\033[%dB' $((2 + row - FEATURE_MENU_SCROLL)) >&2
+    print_feature_row "$row" "$selected"
+  done
+
+  for (( ; row < FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES; row++ )); do
+    printf '\0338\033[%dB\033[K' $((2 + row - FEATURE_MENU_SCROLL)) >&2
+  done
+
+  finish_feature_partial_render
 }
 
 render_feature_menu() {
@@ -306,7 +389,7 @@ render_feature_menu() {
     printf '\033[K\n' >&2
   done
 
-  printf '\033[K\n↑/↓ move/scroll, ←/→ collapse/expand, Space toggle item, g toggle group, Enter continue, a toggle all, q cancel\033[K\n' >&2
+  printf '\033[K\n↑/↓ move/scroll, ←/→ collapse/expand, Space toggle selection, Enter continue, a toggle all, q cancel\033[K\n' >&2
   FEATURE_MENU_RENDERED_LINES=1
 }
 
@@ -429,6 +512,17 @@ build_visible_feature_rows() {
   VISIBLE_ROW_COUNT="${#visible_row_types[@]}"
 }
 
+visible_group_row() {
+  local group="$1" i
+  for i in "${!visible_row_types[@]}"; do
+    if [[ "${visible_row_types[$i]}" == "group" && "${visible_row_groups[$i]}" == "$group" ]]; then
+      printf '%s' "$i"
+      return
+    fi
+  done
+  printf '%s' "0"
+}
+
 first_visible_item_row() {
   local i
   for i in "${!visible_row_types[@]}"; do
@@ -457,14 +551,23 @@ clamp_feature_cursor() {
 }
 
 adjust_feature_scroll() {
+  local max_scroll
   clamp_feature_cursor
-  if (( selected_row < FEATURE_MENU_SCROLL )); then
-    FEATURE_MENU_SCROLL="$selected_row"
-  elif (( selected_row >= FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES )); then
-    FEATURE_MENU_SCROLL=$((selected_row - FEATURE_MENU_BODY_LINES + 1))
+  max_scroll=$((VISIBLE_ROW_COUNT - FEATURE_MENU_BODY_LINES))
+  if (( max_scroll < 0 )); then
+    max_scroll=0
   fi
+
+  if (( selected_row <= FEATURE_MENU_SCROLL + 2 && FEATURE_MENU_SCROLL > 0 )); then
+    FEATURE_MENU_SCROLL=$((selected_row - 3))
+  elif (( selected_row >= FEATURE_MENU_SCROLL + FEATURE_MENU_BODY_LINES - 3 && FEATURE_MENU_SCROLL < max_scroll )); then
+    FEATURE_MENU_SCROLL=$((selected_row - FEATURE_MENU_BODY_LINES + 4))
+  fi
+
   if (( FEATURE_MENU_SCROLL < 0 )); then
     FEATURE_MENU_SCROLL=0
+  elif (( FEATURE_MENU_SCROLL > max_scroll )); then
+    FEATURE_MENU_SCROLL="$max_scroll"
   fi
 }
 
@@ -486,7 +589,7 @@ toggle_group() {
 
 select_features() {
   local selected_row=0 key i any_selected row_type feature_index group
-  local needs_full_render=1 old_selected_row old_scroll
+  local needs_full_render=1 needs_body_render=0 old_selected_row old_scroll
 
   discover_features
   if (( FEATURE_COUNT == 0 )); then
@@ -510,6 +613,10 @@ select_features() {
     if (( needs_full_render )); then
       render_feature_menu "$selected_row"
       needs_full_render=0
+      needs_body_render=0
+    elif (( needs_body_render )); then
+      render_feature_body "$selected_row"
+      needs_body_render=0
     fi
     key="$(read_key)" || { restore_cursor; echo >&2; cancel; }
     row_type="${visible_row_types[$selected_row]}"
@@ -531,7 +638,7 @@ select_features() {
           render_feature_row_at "$selected_row" "$selected_row"
           finish_feature_partial_render
         else
-          needs_full_render=1
+          needs_body_render=1
         fi
         ;;
       $'\e[B')
@@ -544,13 +651,18 @@ select_features() {
           render_feature_row_at "$selected_row" "$selected_row"
           finish_feature_partial_render
         else
-          needs_full_render=1
+          needs_body_render=1
         fi
         ;;
       $'\e[D')
         if [[ "$row_type" == "group" ]] && collapse_group "$group"; then
           build_visible_feature_rows
           clamp_feature_cursor
+          needs_full_render=1
+        elif [[ "$row_type" == "item" ]] && collapse_group "$group"; then
+          build_visible_feature_rows
+          selected_row="$(visible_group_row "$group")"
+          adjust_feature_scroll
           needs_full_render=1
         fi
         ;;
@@ -568,11 +680,9 @@ select_features() {
           else
             feature_selected[$feature_index]="1"
           fi
+        else
+          toggle_group "$group"
         fi
-        needs_full_render=1
-        ;;
-      g|G)
-        toggle_group "$group"
         needs_full_render=1
         ;;
       a|A)
@@ -624,7 +734,6 @@ build_codex_feature_args() {
         fi
         ;;
       plugin) cli_extra_args+=("-c" "plugins.\"$name\".enabled=false") ;;
-      mcp)    cli_extra_args+=("-c" "mcp_servers.$name.enabled=false") ;;
     esac
   done
 

@@ -133,6 +133,19 @@ command = "node-repl"
 EOF
 }
 
+setup_unsorted_codex_resources() {
+  mkdir -p "$HOME/.agents/skills/zeta" "$HOME/.codex/skills/alpha" "$HOME/.codex"
+  printf '%s\n' '---' 'name: zeta' '---' > "$HOME/.agents/skills/zeta/SKILL.md"
+  printf '%s\n' '---' 'name: alpha' '---' > "$HOME/.codex/skills/alpha/SKILL.md"
+  cat > "$HOME/.codex/config.toml" <<'EOF'
+[plugins."delta"]
+enabled = true
+
+[plugins."beta"]
+enabled = true
+EOF
+}
+
 setup_claude_skills() {
   mkdir -p "$HOME/.claude/skills/alpha" "$HOME/.claude/skills/beta"
   printf '%s\n' '---' 'name: alpha' '---' > "$HOME/.claude/skills/alpha/SKILL.md"
@@ -159,6 +172,15 @@ setup_claude_plugins() {
   printf '%s' '{"name":"official"}' > "$HOME/.claude/plugins/marketplaces/official/.claude-plugin/marketplace.json"
   printf '%s' '{"name":"plugin-alpha"}' > "$HOME/.claude/plugins/marketplaces/official/plugins/plugin-alpha/.claude-plugin/plugin.json"
   printf '%s' '{"name":"plugin-beta"}' > "$HOME/.claude/plugins/marketplaces/official/plugins/plugin-beta/.claude-plugin/plugin.json"
+}
+
+setup_claude_prefixed_plugins() {
+  mkdir -p "$HOME/.claude/plugins/marketplaces/official/plugins/browser/.claude-plugin"
+  mkdir -p "$HOME/.claude/plugins/marketplaces/official/plugins/lark-base/.claude-plugin"
+  mkdir -p "$HOME/.claude/plugins/marketplaces/official/plugins/lark-im/.claude-plugin"
+  printf '%s' '{"name":"browser"}' > "$HOME/.claude/plugins/marketplaces/official/plugins/browser/.claude-plugin/plugin.json"
+  printf '%s' '{"name":"lark-base"}' > "$HOME/.claude/plugins/marketplaces/official/plugins/lark-base/.claude-plugin/plugin.json"
+  printf '%s' '{"name":"lark-im"}' > "$HOME/.claude/plugins/marketplaces/official/plugins/lark-im/.claude-plugin/plugin.json"
 }
 
 real_path() {
@@ -207,6 +229,17 @@ setup_many_feature_groups() {
   done
 }
 
+setup_many_small_feature_groups() {
+  local i name
+  mkdir -p "$HOME/.agents/skills"
+  for i in 01 02 03 04 05 06 07 08 09; do
+    for name in "tool$i-alpha" "tool$i-beta"; do
+      mkdir -p "$HOME/.agents/skills/$name"
+      printf '%s\n' '---' "name: $name" '---' > "$HOME/.agents/skills/$name/SKILL.md"
+    done
+  done
+}
+
 # ---------- assertions ----------
 
 assert_eq() {
@@ -233,12 +266,30 @@ assert_not_contains() {
   fi
 }
 
+assert_order() {
+  local hay="$1" first="$2" second="$3" msg="${4:-items are not ordered}"
+  if [[ "$hay" != *"$first"*"$second"* ]]; then
+    printf '    %s\n      first: %q\n      second: %q\n      output: %s\n' "$msg" "$first" "$second" "$hay" >&2
+    return 1
+  fi
+}
+
 first_feature_selector_frame() {
   local out="$1"
   printf '%s' "$out" | awk '
     /Select features to enable:/ {in_frame=1}
     in_frame {print}
     in_frame && /move/ {exit}
+  '
+}
+
+last_feature_selector_frame() {
+  local out="$1"
+  printf '%s' "$out" | awk '
+    /Select features to enable:/ {frame=$0 "\n"; in_frame=1; next}
+    in_frame {frame=frame $0 "\n"}
+    in_frame && /move/ {last=frame; in_frame=0}
+    END {printf "%s", last}
   '
 }
 
@@ -376,12 +427,13 @@ t_invalid_json_denies() {
   assert_contains "$out" "Invalid JSON"
 }
 
-t_codex_resource_selector_disables_unchecked_items() {
+t_codex_resource_selector_disables_unchecked_skills_and_plugins_only() {
   add_fake_cli codex "$CODEX_LOG"
   setup_codex_resources
   export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
   out="$(printf 'a\n''y\n' | bash "$MAIN" --foo 2>&1)"
   assert_contains "$out" "Select features to enable" || return 1
+  assert_not_contains "$out" "mcp" "selector should not show MCP resources" || return 1
   assert_contains "$out" "MOCK_codex_CALLED" || return 1
   got="$(cat "$CODEX_LOG")"
   alpha_skill="$(real_path "$HOME/.codex/skills/alpha/SKILL.md")"
@@ -391,13 +443,25 @@ t_codex_resource_selector_disables_unchecked_items() {
     "skills.config=[{path=\"$alpha_skill\",enabled=false},{path=\"$beta_skill\",enabled=false}]" \
     "-c" \
     'plugins."browser@openai-bundled".enabled=false' \
-    "-c" \
-    "mcp_servers.node_repl.enabled=false" \
     "--foo")"
   assert_eq "$got" "$want" "disabled Codex resources were not converted to config overrides" || return 1
   assert_not_contains "$got" 'skills."alpha".enabled=false' "Codex skill disable should not use unsupported -c key"
+  assert_not_contains "$got" "mcp_servers.node_repl.enabled=false" "MCP resources should be ignored"
   got_env="$(cat "$CODEX_LOG.codex_env")"
   assert_eq "$got_env" "" "Codex skill disable should not use temporary CODEX_HOME"
+}
+
+t_features_are_sorted_by_type_then_name() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_unsorted_codex_resources
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf 'q' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  frame="$(first_feature_selector_frame "$out")"
+  assert_order "$frame" "skill   alpha" "skill   zeta" "skills should be globally sorted by name across scanned directories" || return 1
+  assert_order "$frame" "skill   zeta" "plugin  beta" "skills should be displayed before plugins" || return 1
+  assert_order "$frame" "plugin  beta" "plugin  delta" "plugins should be sorted by name"
 }
 
 t_codex_reads_agents_symlink_skills_and_uses_real_paths() {
@@ -422,7 +486,7 @@ t_feature_group_toggle_disables_group_members() {
   add_fake_cli codex "$CODEX_LOG"
   setup_agent_symlink_skills
   export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
-  out="$(printf 'g\n''y\n' | bash "$MAIN" --foo 2>&1)"
+  out="$(printf '\033[A \n''y\n' | bash "$MAIN" --foo 2>&1)"
   assert_contains "$out" "lark" || return 1
   assert_not_contains "$out" "group  lark" || return 1
   assert_contains "$out" $'\033[1mlark\033[0m' || return 1
@@ -437,11 +501,46 @@ t_feature_group_toggle_disables_group_members() {
   assert_eq "$got" "$want" "group toggle did not disable all group members"
 }
 
+t_left_arrow_on_item_collapses_group_and_selects_group_row() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_agent_symlink_skills
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\033[Dq' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "> [x] "$'\033[1m'"lark"$'\033[0m'" (2, collapsed)" "Left arrow on an item should collapse its group and select the group row" || return 1
+}
+
+t_right_arrow_on_item_is_ignored() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_agent_symlink_skills
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  out="$(printf '\033[Cq' | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" ">   [x] skill   lark-approval" "Right arrow on an item should leave focus on the item" || return 1
+  assert_not_contains "$out" "collapsed" "Right arrow on an item should not collapse the current group" || return 1
+}
+
+t_prefixed_plugins_are_grouped_separately_from_generic_plugins() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  setup_claude_prefixed_plugins
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf '\033[B \n''y\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" $'\033[1mplugin\033[0m' || return 1
+  assert_contains "$out" $'\033[1mlark\033[0m' || return 1
+  got="$(cat "$CLAUDE_LOG")"
+  want="$(printf '%s\n' \
+    "--settings" \
+    '{"enabledPlugins":{"lark-base@official":false,"lark-im@official":false}}')"
+  assert_eq "$got" "$want" "Space on a prefixed plugin group should disable only that plugin group"
+}
+
 t_prefix_root_skill_joins_prefixed_group() {
   add_fake_cli codex "$CODEX_LOG"
   setup_understand_skills
   export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
-  out="$(printf 'g\n''y\n' | bash "$MAIN" --foo 2>&1)"
+  out="$(printf '\033[A \n''y\n' | bash "$MAIN" --foo 2>&1)"
   assert_contains "$out" $'\033[1munderstand\033[0m' || return 1
   assert_not_contains "$out" $'\033[1mskill\033[0m' || return 1
   got="$(cat "$CODEX_LOG")"
@@ -458,7 +557,7 @@ t_bundle_symlink_skills_are_discovered_and_grouped() {
   add_fake_cli codex "$CODEX_LOG"
   setup_superpowers_bundle_skills
   export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
-  out="$(printf 'g\n''y\n' | bash "$MAIN" --foo 2>&1)"
+  out="$(printf '\033[A \n''y\n' | bash "$MAIN" --foo 2>&1)"
   assert_contains "$out" $'\033[1msuperpowers\033[0m' || return 1
   assert_contains "$out" "superpowers:brainstorming" || return 1
   assert_contains "$out" "superpowers:systematic-debugging" || return 1
@@ -542,7 +641,7 @@ t_feature_selector_movement_updates_rows_without_full_redraw() {
 
 t_feature_selector_frame_is_limited_to_20_lines() {
   add_fake_cli codex "$CODEX_LOG"
-  setup_many_feature_groups
+  setup_many_small_feature_groups
   export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
   out="$(printf 'q' | bash "$MAIN" 2>&1)"
   local rc=$?
@@ -550,12 +649,12 @@ t_feature_selector_frame_is_limited_to_20_lines() {
   frame="$(first_feature_selector_frame "$out")"
   line_count="$(printf '%s\n' "$frame" | wc -l | tr -d ' ')"
   assert_eq "$line_count" "20" "feature selector should render at most 20 lines" || return 1
-  assert_not_contains "$frame" "tool18-alpha" "items beyond the viewport should not be in the first frame"
+  assert_not_contains "$frame" "tool09-alpha" "items beyond the viewport should not be in the first frame"
 }
 
 t_down_scrolls_feature_selector_viewport() {
   add_fake_cli codex "$CODEX_LOG"
-  setup_many_feature_groups
+  setup_many_small_feature_groups
   export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
   local keys="" i
   for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34; do
@@ -564,7 +663,55 @@ t_down_scrolls_feature_selector_viewport() {
   out="$(printf '%sq' "$keys" | bash "$MAIN" 2>&1)"
   local rc=$?
   assert_eq "$rc" "1" || return 1
-  assert_contains "$out" "tool18-alpha" "down key should scroll later rows into the selector viewport"
+  assert_contains "$out" "tool09-beta" "down key should scroll later rows into the selector viewport"
+}
+
+t_down_scrolls_when_focus_reaches_third_row_from_bottom() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_small_feature_groups
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  local keys="" i
+  for i in 01 02 03 04 05 06 07 08 09 10 11 12; do
+    keys+=$'\033[B'
+  done
+  out="$(printf '%sq' "$keys" | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  assert_contains "$out" "tool06-alpha" "down movement should render newly visible rows when focus reaches the third row from the bottom"
+}
+
+t_scrolling_refreshes_rows_without_reprinting_prompt() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_small_feature_groups
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  local keys="" i
+  for i in 01 02 03 04 05 06 07 08 09 10 11 12; do
+    keys+=$'\033[B'
+  done
+  out="$(printf '%sq' "$keys" | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  count="$(count_occurrences "$out" "↑/↓ move/scroll")"
+  assert_eq "$count" "1" "scroll redraw should not reprint the footer prompt" || return 1
+  assert_contains "$out" "tool06-alpha" "scroll redraw should still render newly visible rows"
+}
+
+t_up_scrolls_when_focus_reaches_third_row_from_top() {
+  add_fake_cli codex "$CODEX_LOG"
+  setup_many_small_feature_groups
+  export MOCK_RESP='{"ip":"1.2.3.4","country":"CN"}'
+  local keys="" i
+  for i in 01 02 03 04 05 06 07 08 09 10 11 12 13; do
+    keys+=$'\033[B'
+  done
+  for i in 01 02 03 04 05 06 07 08 09 10; do
+    keys+=$'\033[A'
+  done
+  out="$(printf '%sq' "$keys" | bash "$MAIN" 2>&1)"
+  local rc=$?
+  assert_eq "$rc" "1" || return 1
+  frame="$(last_feature_selector_frame "$out")"
+  assert_contains "$frame" "tool01-alpha" "viewport should scroll back up when focus reaches the third row from the top"
 }
 
 t_codex_unchecked_skill_uses_skills_config_override() {
@@ -599,6 +746,22 @@ t_claude_unchecked_skill_uses_settings_override() {
   got_env="$(cat "$CLAUDE_LOG.env")"
   assert_eq "$got_env" "" "Claude settings override should not use CLAUDE_CONFIG_DIR" || return 1
   [[ ! -d ".temp/.claude" ]] || { echo "    .temp/.claude should not be created for Claude settings override" >&2; rm -rf ".temp"; return 1; }
+}
+
+t_claude_does_not_scan_agents_skills() {
+  add_fake_cli claude "$CLAUDE_LOG"
+  setup_agent_symlink_skills
+  setup_claude_skills
+  export MOCK_RESP='{"ip":"5.6.7.8","country":"HK"}'
+  out="$(printf ' \n''y\n' | bash "$MAIN" 2>&1)"
+  assert_contains "$out" "MOCK_claude_CALLED" || return 1
+  assert_not_contains "$out" "lark-approval" "Claude selector should not show ~/.agents skills" || return 1
+  assert_not_contains "$out" "lark-apps" "Claude selector should not show ~/.agents skills" || return 1
+  got="$(cat "$CLAUDE_LOG")"
+  want="$(printf '%s\n' \
+    "--settings" \
+    '{"skillOverrides":{"alpha":"off"}}')"
+  assert_eq "$got" "$want" "Claude should only disable skills that Claude Code reads"
 }
 
 t_claude_unchecked_skill_preserves_user_args() {
@@ -738,9 +901,13 @@ run_test "selector Down+Enter chooses second CLI"            t_selector_down_ent
 run_test "selector q cancels"                                t_selector_q_cancels
 run_test "curl failure -> deny"                              t_curl_failure_denies
 run_test "invalid JSON response -> deny"                     t_invalid_json_denies
-run_test "codex unchecked resources become -c disables"      t_codex_resource_selector_disables_unchecked_items
+run_test "codex unchecked skills/plugins become disables"    t_codex_resource_selector_disables_unchecked_skills_and_plugins_only
+run_test "features sorted by type then name"                 t_features_are_sorted_by_type_then_name
 run_test "codex reads agent symlink skills real paths"       t_codex_reads_agents_symlink_skills_and_uses_real_paths
-run_test "feature group toggle disables group members"       t_feature_group_toggle_disables_group_members
+run_test "Space on group toggles group members"              t_feature_group_toggle_disables_group_members
+run_test "Left on item collapses group"                      t_left_arrow_on_item_collapses_group_and_selects_group_row
+run_test "Right on item is ignored"                          t_right_arrow_on_item_is_ignored
+run_test "prefixed plugins are grouped"                      t_prefixed_plugins_are_grouped_separately_from_generic_plugins
 run_test "prefix root skill joins prefixed group"            t_prefix_root_skill_joins_prefixed_group
 run_test "bundle symlink skills are discovered and grouped"  t_bundle_symlink_skills_are_discovered_and_grouped
 run_test "large groups collapse by default"                  t_large_group_is_collapsed_by_default
@@ -751,8 +918,12 @@ run_test "feature selector redraw restores saved cursor"     t_feature_selector_
 run_test "feature selector movement updates rows only"       t_feature_selector_movement_updates_rows_without_full_redraw
 run_test "feature selector renders max 20 lines"             t_feature_selector_frame_is_limited_to_20_lines
 run_test "Down scrolls feature selector viewport"            t_down_scrolls_feature_selector_viewport
+run_test "Down scrolls at third row from bottom"             t_down_scrolls_when_focus_reaches_third_row_from_bottom
+run_test "scrolling refreshes rows only"                     t_scrolling_refreshes_rows_without_reprinting_prompt
+run_test "Up scrolls at third row from top"                  t_up_scrolls_when_focus_reaches_third_row_from_top
 run_test "codex unchecked skill uses skills.config"          t_codex_unchecked_skill_uses_skills_config_override
 run_test "claude unchecked skill uses --settings"             t_claude_unchecked_skill_uses_settings_override
+run_test "claude ignores agents skills"                       t_claude_does_not_scan_agents_skills
 run_test "claude unchecked skill preserves args"               t_claude_unchecked_skill_preserves_user_args
 run_test "claude unchecked plugin uses enabledPlugins"         t_claude_unchecked_plugin_uses_enabled_plugins_setting
 run_test "claude existing project .claude does not block"      t_claude_existing_project_claude_does_not_block_settings_override
